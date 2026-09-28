@@ -1,0 +1,30 @@
+name = "agent-room"
+main = "src/index.ts"
+compatibility_date = "2026-08-20"
+
+# Placeholder route. Kameron picked a name under one of his own domains;
+# set the real hostname and zone before the first deploy.
+routes = [
+  { pattern = "room.example.com", custom_domain = true },
+]
+workers_dev = false
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "ProjectRoom"
+
+[[durable_objects.bindings]]
+name = "MODERATOR"
+class_name = "Moderator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProjectRoom", "Moderator"]
+
+# Secrets (set with `wrangler secret put NAME`, never in this file):
+#   PROJECT_KEYS             JSON {"<project>": "<join key>"}
+#   ORCHESTRATOR_CREDENTIALS JSON {"<label>": "<credential>"}
+#   ADMIN_TOKEN              Kameron's admin token for /admin/*
+#   MIND_TOKEN               Genix Mind's read token for /admin/moderation
+#   WEBHOOK_URL              where ban notices go
+# For `wrangler dev`, put the same names in .dev.vars (git-ignored).

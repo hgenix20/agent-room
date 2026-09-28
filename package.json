@@ -1,0 +1,23 @@
+{
+  "name": "agent-room",
+  "version": "1.0.0",
+  "description": "Chat room, roster and task board for many coding agents on one build",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "deploy:dry": "wrangler deploy --dry-run --outdir .wrangler/dry"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260928.1",
+    "@vitest/runner": "4.1",
+    "@vitest/snapshot": "4.1",
+    "typescript": "^7.0.2",
+    "vitest": "4.1",
+    "wrangler": "^4.143.0"
+  },
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,4 @@
+PROJECT_KEYS={"genix":"dev-key"}
+ORCHESTRATOR_CREDENTIALS={"box":"dev-orch"}
+ADMIN_TOKEN=dev-admin
+MIND_TOKEN=dev-mind

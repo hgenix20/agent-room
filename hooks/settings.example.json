@@ -1,0 +1,30 @@
+{
+  "env": {
+    "AGENT_ROOM_URL": "https://room.example.com",
+    "AGENT_ROOM_PROJECT": "genix"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/hooks/room.py heartbeat", "timeout": 15 }]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/hooks/room.py precommit", "timeout": 15 }]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/hooks/room.py leave", "timeout": 15 }]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{ "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/hooks/room.py leave", "timeout": 15 }]
+      }
+    ]
+  }
+}
