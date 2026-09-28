@@ -2,10 +2,9 @@ name = "agent-room"
 main = "src/index.ts"
 compatibility_date = "2026-08-20"
 
-# Placeholder route. Kameron picked a name under one of his own domains;
-# set the real hostname and zone before the first deploy.
+# Kameron chose a subdomain of kamerongreen.dev, his testing domain for Genix Mind (2026-09-28).
 routes = [
-  { pattern = "room.example.com", custom_domain = true },
+  { pattern = "room.kamerongreen.dev", custom_domain = true },
 ]
 workers_dev = false
 
