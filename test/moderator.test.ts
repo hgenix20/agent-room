@@ -128,8 +128,12 @@ describe("ban rules", () => {
     const a = await joinSub(parent, uid("flood"));
     const bystander = await joinSub(parent, uid("bystander"), a.ip); // shares the flooder's address
     const flood = async () => {
+      // Post until the room pushes back. A minute boundary can fall mid-burst, so the count is not fixed.
       let last;
-      for (let i = 0; i < 61; i++) last = await post(a, "say", { text: `loop ${i}` });
+      for (let i = 0; i < 130; i++) {
+        last = await post(a, "say", { text: `loop ${i}` });
+        if (last.status !== 200) break;
+      }
       return last!;
     };
     // step 1: three flooded minutes, a warning to the agent and its parent, still writing
