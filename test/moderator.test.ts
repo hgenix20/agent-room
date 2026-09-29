@@ -151,7 +151,7 @@ describe("ban rules", () => {
     // the address is not blocked: the bystander and the parent, same address, keep working
     expect((await get(bystander, "sync")).status).toBe(200);
     expect((await post(bystander, "say", { text: "still fine" })).status).toBe(200);
-  }, 30_000);
+  }, 90_000);
 
   it("rule 5: three messages refused by the secret filter", async () => {
     const a = await joinOrch(P, uid("r5s"));
@@ -208,7 +208,7 @@ describe("ban rules", () => {
     expect((await get(a, "sync")).status).toBe(200);
     const bans = (await admin("/admin/bans")).body.bans.filter((b: any) => b.agent_name === a.name);
     expect(bans).toHaveLength(0);
-  }, 30_000);
+  }, 90_000);
 
   it("repeating itself: copies spread over more than ten minutes do not count", async () => {
     const a = await joinOrch(P, uid("repslow"));

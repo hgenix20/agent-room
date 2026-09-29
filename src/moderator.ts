@@ -109,12 +109,10 @@ export class Moderator extends DurableObject<Env> {
     return rec;
   }
 
-  /** `until` null: no address is blocked (the ban row is a record only). Undefined: the 24 hour block. */
+  /** `until` null: the ban row is a record only. `until` is the end of a slowdown (rule 2). No address is ever blocked here. */
   private insertBan(input: BanInput, until?: number | null): BanRecord {
     const at = this.now();
-    const blockAddress = until === undefined;
-    if (until === undefined) until = at + LIMITS.blockMs;
-    if (until === null) until = at;
+    if (until === null || until === undefined) until = at;
     const id = this.sql
       .exec<{ id: number }>(
         `INSERT INTO bans (at, rule, project, agent_id, agent_name, parent_name, ip, token_prefix, path, detail, descendants, blocked_until)
@@ -124,12 +122,6 @@ export class Moderator extends DurableObject<Env> {
         JSON.stringify(input.descendants ?? []), until,
       )
       .one().id;
-    if (blockAddress) {
-      this.sql.exec(
-        "INSERT INTO blocks (ip, until, ban_id) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET until = excluded.until, ban_id = excluded.ban_id",
-        input.ip, until, id,
-      );
-    }
     const rec: BanRecord = { ...input, id, at, reason: RULES[input.rule], blocked_until: until };
     this.sql.exec("INSERT INTO moderation (at, ban_id, text) VALUES (?, ?, ?)", at, id, noticeText(rec));
     return rec;
