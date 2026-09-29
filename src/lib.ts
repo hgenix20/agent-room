@@ -22,6 +22,9 @@ export const LIMITS = {
   strikesForBan: 3, // rule 5: per hour
   badTokenStrikes: 5, // rule 2: per 10 minutes, one source
   badTokenWindowMs: 10 * 60_000,
+  slowMs: 10 * 60_000, // rule 2: tokenless calls from one address, 429
+  floodStrikes: 3, // rule 5 step trigger: per hour
+  readOnlyMs: 15 * 60_000,
   blockMs: 24 * 60 * 60_000,
 };
 
@@ -177,8 +180,8 @@ export function json(body: unknown, status = 200): Response {
 
 export const RULES: Record<number, string> = {
   1: "join with the project key but no valid orchestrator credential or parent token",
-  2: "revoked, expired or malformed token 5 times in 10 minutes from one source",
+  2: "5 calls without a valid token in 10 minutes from one source (tokenless calls from it slowed 10 minutes)",
   3: "token used against a project it was not issued for",
   4: "parent is gone or banned",
-  5: "rate limit exceeded 3 times in an hour, or 3 messages refused by the secret filter",
+  5: "flooding (over 60 writes a minute, 3 times in an hour: warning, 15 minutes read-only, then revoked), or 3 messages refused by the secret filter",
 };

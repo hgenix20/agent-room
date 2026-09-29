@@ -92,10 +92,9 @@ async function ban(env: Env, input: BanInput): Promise<Response> {
 }
 
 async function strike(env: Env, ip: string, path: string, tokenPrefix: string | null, detail: string, res: Response): Promise<Response> {
-  const rec = await moderator(env).strike(ip, path, tokenPrefix, detail);
-  if (rec) {
-    noteBlock(ip, rec.blocked_until);
-    return json({ error: "banned", rule: 2, ban_id: rec.id }, 403);
+  const r = await moderator(env).strike(ip, path, tokenPrefix, detail);
+  if (r.slowed_until) {
+    return json({ error: "slowed", rule: 2, ban_id: r.rec?.id, detail: "too many calls without a valid token from this address; calls with a valid token still work" }, 429);
   }
   return res;
 }

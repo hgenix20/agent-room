@@ -39,24 +39,43 @@ describe("ban rules", () => {
     expect(f.body.rule).toBe(1);
   });
 
-  it("rule 2: five bad-token calls in ten minutes from one source", async () => {
+  it("rule 2: five tokenless calls in ten minutes slow the source, they do not block it", async () => {
     const ip = newIp();
     const tokens = ["garbage", "ar1.genix.a000000000000.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "", "Bearer", "ar1.genix.a111111111111.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"];
     const statuses = [];
-    for (const t of tokens) statuses.push((await req(`/p/${P}/sync`, { ip, token: t || undefined })).status);
+    let last: any;
+    for (const t of tokens) {
+      last = await req(`/p/${P}/sync`, { ip, token: t || undefined });
+      statuses.push(last.status);
+    }
     expect(statuses.slice(0, 4)).toEqual([401, 401, 401, 401]);
-    expect(statuses[4]).toBe(403);
-    const last = await req(`/p/${P}/sync`, { ip });
-    expect(last.body.error).toBe("blocked");
+    expect(statuses[4]).toBe(429);
+    expect(last.body.rule).toBe(2);
+    const ban = await banById(last.body.ban_id);
+    expect(ban).toMatchObject({ rule: 2, ip });
+    expect((await req(`/p/${P}/sync`, { ip })).status).toBe(429);
   });
 
-  it("rule 2 counts a revoked token", async () => {
+  it("a token holder on a slowed address still works; the address recovers after ten minutes", async () => {
+    const o = await joinOrch(P, uid("slowok"));
+    for (let i = 0; i < 5; i++) await req(`/p/${P}/sync`, { ip: o.ip, token: "junk" });
+    expect((await req(`/p/${P}/sync`, { ip: o.ip })).status).toBe(429);
+    expect((await get(o, "sync")).status).toBe(200);
+    expect((await post(o, "say", { text: "still here" })).status).toBe(200);
+    await advance(P, 9 * 60_000);
+    expect((await req(`/p/${P}/sync`, { ip: o.ip })).status).toBe(429);
+    await advance(P, 2 * 60_000);
+    expect((await req(`/p/${P}/sync`, { ip: o.ip })).status).toBe(401);
+    expect((await get(o, "sync")).status).toBe(200);
+  });
+
+  it("rule 2 counts a revoked token, and slows rather than blocks", async () => {
     const o = await joinOrch(P, uid("r2rev"));
     const rv = await admin("/admin/revoke", { project: P, agent: o.name });
     expect(rv.status).toBe(200);
     for (let i = 0; i < 4; i++) expect((await get(o, "sync")).status).toBe(401);
     const fifth = await get(o, "sync");
-    expect(fifth.status).toBe(403);
+    expect(fifth.status).toBe(429);
     expect(fifth.body.rule).toBe(2);
   });
 
@@ -104,21 +123,53 @@ describe("ban rules", () => {
     expect((await get(o, "sync")).status).toBe(200);
   });
 
-  it("rule 5: rate limit exceeded in three separate minutes within an hour", async () => {
-    const a = await joinOrch(P, uid("r5r"));
-    for (let round = 0; round < 3; round++) {
+  it("rule 5: flooding escalates per agent: warning, 15 minutes read-only, then revoked", async () => {
+    const parent = await joinOrch(P, uid("floodp"));
+    const a = await joinSub(parent, uid("flood"));
+    const bystander = await joinSub(parent, uid("bystander"), a.ip); // shares the flooder's address
+    const flood = async () => {
       let last;
-      for (let i = 0; i < 61; i++) last = await post(a, "say", { text: `loop ${round} ${i}` });
-      if (round < 2) {
-        expect(last!.status).toBe(429);
-        await advance(P, 61_000);
-      } else {
-        expect(last!.status).toBe(403);
-        expect(last!.body.rule).toBe(5);
-      }
+      for (let i = 0; i < 61; i++) last = await post(a, "say", { text: `loop ${i}` });
+      return last!;
+    };
+    // step 1: three flooded minutes, a warning to the agent and its parent, still writing
+    for (let round = 0; round < 3; round++) {
+      expect((await flood()).status).toBe(429);
+      await advance(P, 61_000);
     }
-    expect((await req(`/p/${P}/sync`, { ip: newIp(), token: a.token })).status).toBe(401);
-  });
+    const warn = (await get(bystander, "sync", "?since=0&limit=500")).body.events.filter((e: any) => e.by === "moderator");
+    expect(warn.length).toBe(1);
+    expect(warn[0].mentions).toEqual(expect.arrayContaining([a.name, parent.name]));
+    expect((await post(a, "say", { text: "after warning" })).status).toBe(200);
+    // step 2: three more, read-only for 15 minutes
+    for (let round = 0; round < 3; round++) {
+      const r = await flood();
+      expect(r.status).toBe(round < 2 ? 429 : 403);
+      if (round === 2) expect(r.body.error).toBe("read_only");
+      await advance(P, 61_000);
+    }
+    const ro = await post(a, "say", { text: "nope" });
+    expect(ro.status).toBe(403);
+    expect(ro.body.error).toBe("read_only");
+    expect((await get(a, "sync")).status).toBe(200);
+    expect((await post(bystander, "say", { text: "unaffected" })).status).toBe(200);
+    await advance(P, 15 * 60_000);
+    expect((await post(a, "say", { text: "back" })).status).toBe(200);
+    // step 3: three more, token revoked and a ban row with the rule
+    let last: any;
+    for (let round = 0; round < 3; round++) {
+      last = await flood();
+      await advance(P, 61_000);
+    }
+    expect(last.status).toBe(403);
+    expect(last.body.rule).toBe(5);
+    const ban = await banById(last.body.ban_id);
+    expect(ban).toMatchObject({ rule: 5, agent_name: a.name, parent_name: parent.name });
+    expect((await get(a, "sync")).status).toBe(401);
+    // the address is not blocked: the bystander and the parent, same address, keep working
+    expect((await get(bystander, "sync")).status).toBe(200);
+    expect((await post(bystander, "say", { text: "still fine" })).status).toBe(200);
+  }, 30_000);
 
   it("rule 5: three messages refused by the secret filter", async () => {
     const a = await joinOrch(P, uid("r5s"));

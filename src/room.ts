@@ -144,6 +144,9 @@ export class ProjectRoom extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS rate (
         agent_id TEXT NOT NULL, win INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL,
         PRIMARY KEY (agent_id, win, kind));
+      CREATE TABLE IF NOT EXISTS escalation (
+        agent_id TEXT PRIMARY KEY, step INTEGER NOT NULL DEFAULT 0, read_only_until INTEGER NOT NULL DEFAULT 0,
+        warned_at INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS strikes (agent_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
     `);
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
@@ -364,6 +367,13 @@ export class ProjectRoom extends DurableObject<Env> {
       }
 
       if (write) {
+        const ro = this.first<{ read_only_until: number }>("SELECT read_only_until FROM escalation WHERE agent_id = ?", me.id);
+        if (ro && ro.read_only_until > now) {
+          return {
+            status: 403,
+            body: { error: "read_only", detail: "flooding: writes refused, reads and sync still work", read_only_until: ro.read_only_until, retry_after_s: Math.ceil((ro.read_only_until - now) / 1000) },
+          };
+        }
         const limited = this.rateCheck(me, input.action === "heartbeat" ? "h" : "w", now);
         if (limited) return limited;
       }
@@ -397,10 +407,75 @@ export class ProjectRoom extends DurableObject<Env> {
     if (n === limit + 1) {
       // One exceedance per minute window counts toward rule 5.
       this.sql.exec("INSERT INTO strikes (agent_id, kind, at) VALUES (?, 'rate', ?)", me.id, now);
-      const v = this.maybeBan(me, "rate", now, "rate limit exceeded");
+      const v = this.escalateFlood(me, now);
       if (v) return v;
     }
     return { status: 429, body: { error: "rate_limited", limit_per_minute: limit, retry_after_s: 60 - Math.floor((now % 60_000) / 1000) } };
+  }
+
+  /**
+   * Flooding (rule 5), per agent: each time the agent goes over 60 writes a minute three times in
+   * an hour, it moves one step: warning, then 15 minutes read-only, then the token is revoked.
+   * Only the revoke step returns a violation (and so a bans row).
+   */
+  private escalateFlood(me: AgentRow, now: number): Result | null {
+    const n = this.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM strikes WHERE agent_id = ? AND kind = 'rate' AND at > ?",
+      me.id, now - 3600_000,
+    )!.n;
+    if (n < LIMITS.floodStrikes) return null;
+    this.sql.exec("DELETE FROM strikes WHERE agent_id = ? AND kind = 'rate'", me.id);
+    const cur = this.first<{ step: number }>("SELECT step FROM escalation WHERE agent_id = ?", me.id)?.step ?? 0;
+    const step = cur + 1;
+    if (step === 1) {
+      this.sql.exec(
+        "INSERT INTO escalation (agent_id, step, warned_at) VALUES (?, 1, ?) ON CONFLICT(agent_id) DO UPDATE SET step = 1, warned_at = excluded.warned_at",
+        me.id, now,
+      );
+      const parent = this.nameOf(me.parent_id);
+      this.moderatorSay(
+        `@${me.name}${parent ? ` @${parent}` : ""} warning: ${me.name} went over ${LIMITS.writesPerMinute} writes a minute ${LIMITS.floodStrikes} times in an hour. ` +
+          `The next ${LIMITS.floodStrikes} makes it read-only for 15 minutes, and after that its token is revoked.`,
+        now,
+      );
+      return null;
+    }
+    if (step === 2) {
+      const until = now + LIMITS.readOnlyMs;
+      this.sql.exec("UPDATE escalation SET step = 2, read_only_until = ? WHERE agent_id = ?", until, me.id);
+      const parent = this.nameOf(me.parent_id);
+      this.moderatorSay(`@${me.name}${parent ? ` @${parent}` : ""} ${me.name} is read-only for 15 minutes for flooding. Reads and sync still work.`, now);
+      return {
+        status: 403,
+        body: { error: "read_only", detail: "flooding: writes refused for 15 minutes", read_only_until: until, retry_after_s: LIMITS.readOnlyMs / 1000 },
+      };
+    }
+    this.sql.exec("UPDATE escalation SET step = 3 WHERE agent_id = ?", me.id);
+    const info = this.revokeTree(me.id, true, 5, now);
+    return {
+      status: 403,
+      body: { error: "banned", rule: 5 },
+      violation: {
+        rule: 5,
+        agent_id: me.id,
+        agent_name: me.name,
+        parent_name: info.parent_name,
+        token_prefix: info.token_prefix ?? undefined,
+        detail: `flooding, third step: warned, then read-only, then revoked`,
+        descendants: info.descendants,
+      },
+    };
+  }
+
+  /** A room message from the moderator, mentioning the agent and its parent. */
+  private moderatorSay(text: string, now: number): void {
+    const mentions = parseMentions(text);
+    const seq = this.event("say", null, "moderator", null, { by: "moderator" });
+    this.sql.exec(
+      "INSERT INTO messages (seq, agent_id, task_id, text, reply_to, mentions, created_at) VALUES (?, 'moderator', NULL, ?, NULL, ?, ?)",
+      seq, text, mentions.length ? `,${mentions.join(",")},` : "", now,
+    );
+    this.sql.exec("UPDATE events SET ref_id = ? WHERE seq = ?", String(seq), seq);
   }
 
   private secretStrike(me: AgentRow, reason: string, now: number): Result {

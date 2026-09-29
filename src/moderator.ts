@@ -43,6 +43,7 @@ export class Moderator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS unbans (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ban_id INTEGER NOT NULL, at INTEGER NOT NULL, note TEXT);
       CREATE TABLE IF NOT EXISTS blocks (ip TEXT PRIMARY KEY, until INTEGER NOT NULL, ban_id INTEGER);
+      CREATE TABLE IF NOT EXISTS slows (ip TEXT PRIMARY KEY, until INTEGER NOT NULL, ban_id INTEGER);
       CREATE TABLE IF NOT EXISTS strikes (ip TEXT NOT NULL, at INTEGER NOT NULL, token_prefix TEXT, path TEXT);
       CREATE INDEX IF NOT EXISTS strikes_ip ON strikes(ip, at);
       CREATE TABLE IF NOT EXISTS moderation (
@@ -73,30 +74,47 @@ export class Moderator extends DurableObject<Env> {
       .map((r) => [r.ip, r.until]);
   }
 
-  /** Records one bad-token call from a source. The fifth in ten minutes bans (rule 2). */
-  async strike(ip: string, path: string, tokenPrefix: string | null, detail: string): Promise<BanRecord | null> {
+  /**
+   * Records one call with no valid token from a source. The fifth in ten minutes slows that
+   * address (rule 2) for ten minutes, for tokenless calls only. Nothing here blocks the address:
+   * callers with a valid token are never checked against it. A call made while slowed is refused
+   * and adds no strike, so the slowdown ends ten minutes after it began.
+   */
+  async strike(ip: string, path: string, tokenPrefix: string | null, detail: string): Promise<{ slowed_until: number; rec: BanRecord | null }> {
     const now = this.now();
-    const rec = this.ctx.storage.transactionSync(() => {
+    const out = this.ctx.storage.transactionSync(() => {
+      const slow = this.sql.exec<{ until: number; ban_id: number | null }>("SELECT until, ban_id FROM slows WHERE ip = ?", ip).toArray()[0];
+      if (slow && slow.until > now) return { slowed_until: slow.until, rec: null, ban_id: slow.ban_id };
       this.sql.exec("DELETE FROM strikes WHERE at < ?", now - LIMITS.badTokenWindowMs);
       this.sql.exec("INSERT INTO strikes (ip, at, token_prefix, path) VALUES (?, ?, ?, ?)", ip, now, tokenPrefix, path);
       const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM strikes WHERE ip = ?", ip).one().n;
-      if (n < LIMITS.badTokenStrikes) return null;
+      if (n < LIMITS.badTokenStrikes) return { slowed_until: 0, rec: null, ban_id: null };
       this.sql.exec("DELETE FROM strikes WHERE ip = ?", ip);
-      return this.insertBan({ rule: 2, ip, path, token_prefix: tokenPrefix, detail: `${n} bad-token calls: ${detail}` });
+      const until = now + LIMITS.slowMs;
+      const rec = this.insertBan({ rule: 2, ip, path, token_prefix: tokenPrefix, detail: `${n} calls without a valid token: ${detail}` }, until);
+      this.sql.exec(
+        "INSERT INTO slows (ip, until, ban_id) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET until = excluded.until, ban_id = excluded.ban_id",
+        ip, until, rec.id,
+      );
+      return { slowed_until: until, rec, ban_id: rec.id };
     });
-    if (rec) await this.notify(rec);
-    return rec;
+    if (out.rec) await this.notify(out.rec);
+    return { slowed_until: out.slowed_until, rec: out.rec };
   }
 
   async ban(input: BanInput): Promise<BanRecord> {
-    const rec = this.ctx.storage.transactionSync(() => this.insertBan(input));
+    // Rules 1, 3 and 4 still block the source for 24 hours; rule 5 (one agent) never blocks an address.
+    const rec = this.ctx.storage.transactionSync(() => this.insertBan(input, input.rule === 5 ? null : undefined));
     await this.notify(rec);
     return rec;
   }
 
-  private insertBan(input: BanInput): BanRecord {
+  /** `until` null: no address is blocked (the ban row is a record only). Undefined: the 24 hour block. */
+  private insertBan(input: BanInput, until?: number | null): BanRecord {
     const at = this.now();
-    const until = at + LIMITS.blockMs;
+    const blockAddress = until === undefined;
+    if (until === undefined) until = at + LIMITS.blockMs;
+    if (until === null) until = at;
     const id = this.sql
       .exec<{ id: number }>(
         `INSERT INTO bans (at, rule, project, agent_id, agent_name, parent_name, ip, token_prefix, path, detail, descendants, blocked_until)
@@ -106,10 +124,12 @@ export class Moderator extends DurableObject<Env> {
         JSON.stringify(input.descendants ?? []), until,
       )
       .one().id;
-    this.sql.exec(
-      "INSERT INTO blocks (ip, until, ban_id) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET until = excluded.until, ban_id = excluded.ban_id",
-      input.ip, until, id,
-    );
+    if (blockAddress) {
+      this.sql.exec(
+        "INSERT INTO blocks (ip, until, ban_id) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET until = excluded.until, ban_id = excluded.ban_id",
+        input.ip, until, id,
+      );
+    }
     const rec: BanRecord = { ...input, id, at, reason: RULES[input.rule], blocked_until: until };
     this.sql.exec("INSERT INTO moderation (at, ban_id, text) VALUES (?, ?, ?)", at, id, noticeText(rec));
     return rec;
@@ -148,6 +168,7 @@ export class Moderator extends DurableObject<Env> {
       if (!b) return null;
       this.sql.exec("INSERT INTO unbans (ban_id, at, note) VALUES (?, ?, ?)", banId, now, note);
       this.sql.exec("DELETE FROM blocks WHERE ip = ?", b.ip as string);
+      this.sql.exec("DELETE FROM slows WHERE ip = ?", b.ip as string);
       this.sql.exec("DELETE FROM strikes WHERE ip = ?", b.ip as string);
       this.sql.exec(
         "INSERT INTO moderation (at, ban_id, text) VALUES (?, ?, ?)",
