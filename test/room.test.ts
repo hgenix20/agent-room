@@ -220,7 +220,7 @@ describe("sync", () => {
     const start = a.cursor;
     for (let i = 0; i < 130; i++) {
       if (i > 0 && i % 55 === 0) await advance(P, 61_000); // stay under 60 writes a minute
-      const r = await post(a, "say", { text: `message ${i}` });
+      const r = await post(a, "say", { text: `message ${i} ${Math.random().toString(36).slice(2)}` });
       expect(r.status).toBe(200);
     }
     const p1 = await get(a, "sync", `?since=${start}`);
@@ -230,8 +230,8 @@ describe("sync", () => {
     expect(p2.body.more).toBe(false);
     const texts = [...p1.body.events, ...p2.body.events].filter((e: any) => e.kind === "say").map((e: any) => e.text);
     expect(texts.length).toBe(130);
-    expect(texts[0]).toBe("message 0");
-    expect(texts[129]).toBe("message 129");
+    expect(texts[0]).toMatch(/^message 0 /);
+    expect(texts[129]).toMatch(/^message 129 /);
     const small = await get(a, "sync", `?since=${start}&limit=10`);
     expect(small.body.events.length).toBe(10);
     const empty = await get(a, "sync", `?since=${p2.body.cursor}`);

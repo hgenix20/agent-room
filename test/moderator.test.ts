@@ -131,7 +131,7 @@ describe("ban rules", () => {
       // Post until the room pushes back. A minute boundary can fall mid-burst, so the count is not fixed.
       let last;
       for (let i = 0; i < 130; i++) {
-        last = await post(a, "say", { text: `loop ${i}` });
+        last = await post(a, "say", { text: `loop ${Math.random().toString(36).slice(2)}${i}` });
         if (last.status !== 200) break;
       }
       return last!;
@@ -194,6 +194,77 @@ describe("ban rules", () => {
     const s = await get(o, "sync", "?since=0&limit=500");
     expect(JSON.stringify(s.body)).not.toContain("AKIAIOSFODNN7EXAMPLE");
   });
+  it("repeating itself: 5 near-identical messages warn, 5 more make it read-only, never revoked", async () => {
+    const parent = await joinOrch(P, uid("reppar"));
+    const a = await joinSub(parent, uid("rep"));
+    const bystander = await joinSub(parent, uid("repby"), a.ip);
+    // the room is shared between tests, so count only notices that name this agent
+    const modMsgs = async () =>
+      (await get(bystander, "sync", `?since=${a.cursor}&limit=500`)).body.events.filter((e: any) => e.by === "moderator" && (e.mentions ?? []).includes(a.name));
+    const text = "Still waiting on the build to finish, will report back when it does";
+    // four copies (the last with a small edit, still over 90% alike) and different chatter: nothing yet
+    for (let i = 0; i < 3; i++) expect((await post(a, "say", { text })).status).toBe(200);
+    expect((await post(a, "say", { text: text + "!" })).status).toBe(200);
+    expect((await post(a, "say", { text: "Completely different: found the failing test in the parser module" })).status).toBe(200);
+    expect(await modMsgs()).toHaveLength(0);
+    // the fifth like it: warning to the agent and its parent, the message itself still lands
+    expect((await post(a, "say", { text })).status).toBe(200);
+    const warn = await modMsgs();
+    expect(warn).toHaveLength(1);
+    expect(warn[0].mentions).toEqual(expect.arrayContaining([a.name, parent.name]));
+    expect((await post(a, "say", { text: "fine after the warning" })).status).toBe(200);
+    // five more: read-only, after the fifth
+    for (let i = 0; i < 4; i++) expect((await post(a, "say", { text })).status).toBe(200);
+    expect(await modMsgs()).toHaveLength(1);
+    expect((await post(a, "say", { text })).status).toBe(200);
+    expect(await modMsgs()).toHaveLength(2);
+    const ro = await post(a, "say", { text: "anything" });
+    expect(ro.status).toBe(403);
+    expect(ro.body.error).toBe("read_only");
+    expect((await get(a, "sync")).status).toBe(200);
+    expect((await post(bystander, "say", { text })).status).toBe(200);
+    expect((await post(bystander, "say", { text: "unaffected" })).status).toBe(200);
+    // after 15 minutes it writes again, and five more copies still do not revoke it
+    await advance(P, 15 * 60_000 + 1000);
+    for (let i = 0; i < 12; i++) expect((await post(a, "say", { text })).status).toBeOneOf([200, 403]);
+    expect((await get(a, "sync")).status).toBe(200);
+    const bans = (await admin("/admin/bans")).body.bans.filter((b: any) => b.agent_name === a.name);
+    expect(bans).toHaveLength(0);
+  }, 30_000);
+
+  it("repeating itself: copies spread over more than ten minutes do not count", async () => {
+    const a = await joinOrch(P, uid("repslow"));
+    for (let i = 0; i < 8; i++) {
+      expect((await post(a, "say", { text: "same old status line" })).status).toBe(200);
+      await advance(P, 3 * 60_000);
+    }
+    const o = await joinOrch(P, uid("repwatch"));
+    const ev = (await get(o, "sync", `?since=${a.cursor}&limit=500`)).body.events.filter((e: any) => e.by === "moderator");
+    expect(ev.filter((e: any) => (e.mentions ?? []).includes(a.name))).toHaveLength(0);
+  });
+
+  it("secret leaks: the third refusal revokes the agent, the address and a neighbour are untouched", async () => {
+    const parent = await joinOrch(P, uid("leakp"));
+    const a = await joinSub(parent, uid("leak"));
+    const bystander = await joinSub(parent, uid("leakby"), a.ip);
+    const leaks = ["key AKIAIOSFODNN7EXAMPLE", "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123", "token ghp_abcdefghijklmnopqrstuvwxyz0123456789"];
+    expect((await post(a, "say", { text: leaks[0] })).status).toBe(422);
+    expect((await post(a, "say", { text: leaks[1] })).status).toBe(422);
+    expect((await get(a, "sync")).status).toBe(200);
+    const r3 = await post(a, "say", { text: leaks[2] });
+    expect(r3.status).toBe(403);
+    expect(r3.body.rule).toBe(5);
+    const ban = await banById(r3.body.ban_id);
+    expect(ban).toMatchObject({ rule: 5, agent_name: a.name, parent_name: parent.name });
+    expect(ban.detail).toContain("secret filter");
+    const mod = await admin("/admin/moderation?since=0", undefined, "mind-test-token");
+    expect(mod.body.messages.some((m: any) => m.ban_id === ban.id)).toBe(true);
+    expect((await get(a, "sync")).status).toBe(401);
+    expect(ban.blocked_until).toBeLessThanOrEqual(ban.at);
+    expect((await get(bystander, "sync")).status).toBe(200);
+    expect((await post(bystander, "say", { text: "still fine" })).status).toBe(200);
+  });
+
 });
 
 describe("admin", () => {

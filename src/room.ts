@@ -147,6 +147,8 @@ export class ProjectRoom extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS escalation (
         agent_id TEXT PRIMARY KEY, step INTEGER NOT NULL DEFAULT 0, read_only_until INTEGER NOT NULL DEFAULT 0,
         warned_at INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS repeat_state (
+        agent_id TEXT PRIMARY KEY, step INTEGER NOT NULL DEFAULT 0, since_seq INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS strikes (agent_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
     `);
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
@@ -371,7 +373,7 @@ export class ProjectRoom extends DurableObject<Env> {
         if (ro && ro.read_only_until > now) {
           return {
             status: 403,
-            body: { error: "read_only", detail: "flooding: writes refused, reads and sync still work", read_only_until: ro.read_only_until, retry_after_s: Math.ceil((ro.read_only_until - now) / 1000) },
+            body: { error: "read_only", detail: "read-only: writes refused, reads and sync still work", read_only_until: ro.read_only_until, retry_after_s: Math.ceil((ro.read_only_until - now) / 1000) },
           };
         }
         const limited = this.rateCheck(me, input.action === "heartbeat" ? "h" : "w", now);
@@ -583,7 +585,44 @@ export class ProjectRoom extends DurableObject<Env> {
       seq, me.id, task, text, replyTo, mentions.length ? `,${mentions.join(",")},` : "", now,
     );
     this.sql.exec("UPDATE events SET ref_id = ? WHERE seq = ?", String(seq), seq);
+    this.escalateRepeat(me, seq, text, now);
     return { status: 200, body: { seq, task } };
+  }
+
+  /**
+   * Repeating itself, per agent: 5 messages in 10 minutes that are at least 90% the same text.
+   * First time a warning, after that 15 minutes read-only. Never revokes, never touches the address.
+   */
+  private escalateRepeat(me: AgentRow, seq: number, text: string, now: number): void {
+    const st = this.first<{ step: number; since_seq: number }>("SELECT step, since_seq FROM repeat_state WHERE agent_id = ?", me.id);
+    const rows = this.rows<{ text: string }>(
+      "SELECT text FROM messages WHERE agent_id = ? AND seq > ? AND seq <= ? AND created_at > ?",
+      me.id, st?.since_seq ?? 0, seq, now - LIMITS.repeatWindowMs,
+    );
+    let same = 0;
+    for (const r of rows) if (similarity(r.text, text) >= LIMITS.repeatSimilarity) same++;
+    if (same < LIMITS.repeatMessages) return;
+    const step = (st?.step ?? 0) + 1;
+    this.sql.exec(
+      "INSERT INTO repeat_state (agent_id, step, since_seq) VALUES (?, ?, ?) ON CONFLICT(agent_id) DO UPDATE SET step = excluded.step, since_seq = excluded.since_seq",
+      me.id, step, seq,
+    );
+    const parent = this.nameOf(me.parent_id);
+    const who = `@${me.name}${parent ? ` @${parent}` : ""}`;
+    if (step === 1) {
+      this.moderatorSay(
+        `${who} warning: ${me.name} posted ${LIMITS.repeatMessages} nearly identical messages in 10 minutes. ` +
+          `Doing it again makes it read-only for 15 minutes.`,
+        now,
+      );
+      return;
+    }
+    const until = now + LIMITS.readOnlyMs;
+    this.sql.exec(
+      "INSERT INTO escalation (agent_id, read_only_until) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET read_only_until = MAX(read_only_until, excluded.read_only_until)",
+      me.id, until,
+    );
+    this.moderatorSay(`${who} ${me.name} is read-only for 15 minutes for repeating itself. Reads and sync still work.`, now);
   }
 
   private createTask(me: AgentRow, body: Record<string, unknown>, now: number): Result {
@@ -839,6 +878,30 @@ class SecretRefused extends Error {
   constructor(public reason: string) {
     super("secret");
   }
+}
+
+/** Dice coefficient over character bigrams of the whitespace-normalised, lowercased text. */
+function similarity(a: string, b: string): number {
+  const norm = (t: string) => t.toLowerCase().replace(/\s+/g, " ").trim();
+  const x = norm(a);
+  const y = norm(b);
+  if (x === y) return 1;
+  if (x.length < 2 || y.length < 2) return 0;
+  const grams = new Map<string, number>();
+  for (let i = 0; i < x.length - 1; i++) {
+    const g = x.slice(i, i + 2);
+    grams.set(g, (grams.get(g) ?? 0) + 1);
+  }
+  let common = 0;
+  for (let i = 0; i < y.length - 1; i++) {
+    const g = y.slice(i, i + 2);
+    const n = grams.get(g);
+    if (n) {
+      common++;
+      grams.set(g, n - 1);
+    }
+  }
+  return (2 * common) / (x.length + y.length - 2);
 }
 
 function checkSecret(text: string): void {

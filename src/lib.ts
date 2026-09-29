@@ -25,6 +25,9 @@ export const LIMITS = {
   slowMs: 10 * 60_000, // rule 2: tokenless calls from one address, 429
   floodStrikes: 3, // rule 5 step trigger: per hour
   readOnlyMs: 15 * 60_000,
+  repeatMessages: 5, // near-identical messages from one agent...
+  repeatWindowMs: 10 * 60_000, // ...in this window
+  repeatSimilarity: 0.9,
   blockMs: 24 * 60 * 60_000,
 };
 
