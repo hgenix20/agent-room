@@ -55,6 +55,8 @@ export interface RevokeInfo {
   parent_name: string | null;
   token_prefix: string | null;
   descendants: string[];
+  /** Direct subagents left on the roster without a parent. */
+  orphans: string[];
 }
 
 interface AgentRow {
@@ -70,6 +72,7 @@ interface AgentRow {
   joined_at: number;
   state: string; // active | left | revoked | banned
   roster_state: string; // active | stale | gone
+  orphaned: number; // 1 while its parent's token is revoked and nobody has adopted it
   [k: string]: SqlStorageValue;
 }
 
@@ -102,7 +105,7 @@ interface TaskRow {
   [k: string]: SqlStorageValue;
 }
 
-const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "claim", "release", "leave"]);
+const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "claim", "release", "leave", "adopt"]);
 
 export class ProjectRoom extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -150,7 +153,11 @@ export class ProjectRoom extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS repeat_state (
         agent_id TEXT PRIMARY KEY, step INTEGER NOT NULL DEFAULT 0, since_seq INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS strikes (agent_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS claim_lock (agent_id TEXT PRIMARY KEY, until INTEGER NOT NULL);
     `);
+    if (!this.sql.exec<{ name: string }>("PRAGMA table_info(agents)").toArray().some((c) => c.name === "orphaned")) {
+      this.sql.exec("ALTER TABLE agents ADD COLUMN orphaned INTEGER NOT NULL DEFAULT 0");
+    }
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
     if (off) this.offset = Number(off.v);
   }
@@ -224,6 +231,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (cur.state === "banned") return cur.id === a.id ? "banned" : "parent_banned";
       if (cur.state !== "active") return cur.id === a.id ? cur.state : "parent_" + cur.state;
       if (!this.alive(cur, now)) return cur.id === a.id ? "expired" : "parent_gone";
+      if (cur.orphaned) break;
       cur = cur.parent_id ? this.agent(cur.parent_id) : undefined;
       depth++;
     }
@@ -236,6 +244,7 @@ export class ProjectRoom extends DurableObject<Env> {
     let depth = 0;
     while (cur && depth < 50) {
       this.sql.exec("UPDATE agents SET tree_seen = ? WHERE id = ?", now, cur.id);
+      if (cur.orphaned) break;
       cur = cur.parent_id ? this.agent(cur.parent_id) : undefined;
       depth++;
     }
@@ -294,20 +303,24 @@ export class ProjectRoom extends DurableObject<Env> {
       let parent: AgentRow | undefined;
       if (input.parentId) {
         parent = this.agent(input.parentId);
-        if (!parent || parent.token_hash !== input.parentTokenHash || parent.state === "revoked") {
-          return { status: 403, body: { error: "banned", rule: 1 }, violation: { rule: 1, detail: "parent token not valid" } };
-        }
-        const problem = this.chainProblem(parent, now);
-        if (problem === "banned" || problem === "parent_banned") {
+        let why: string | null = null;
+        if (!parent) why = "no such parent";
+        else if (parent.token_hash !== input.parentTokenHash) why = "token does not match the parent";
+        else why = this.chainProblem(parent, now);
+        if (!why && parent && input.credLabel && !this.inChainOf(parent, input.credLabel)) why = "parent is not in your chain";
+        if (why) {
+          // Forged ancestry: refused, and the named parent (when it exists) is told. No address is blocked.
+          if (parent) {
+            this.moderatorSay(
+              `@${parent.name} someone tried to join as a subagent of ${parent.name} with a parent token that is not valid (${why}). The join was refused. If it was not you or one of yours, nothing needs doing.`,
+              now,
+            );
+          }
           return {
             status: 403,
-            body: { error: "banned", rule: 4 },
-            violation: { rule: 4, parent_name: parent.name, detail: `parent ${parent.name} is banned` },
+            body: { error: "forged_ancestry", rule: 6, detail: why },
+            violation: { rule: 6, parent_name: parent?.name ?? null, detail: `join named a parent token that is not live or not in the joiner's chain: ${why}` },
           };
-        }
-        if (problem) {
-          // Parent gone or left: the join is refused and counted as an expired token (rule 2).
-          return { status: 401, body: { error: "parent_gone", detail: problem }, badToken: true };
         }
       }
       const idemScope = input.parentId ? `join:parent:${input.parentId}` : `join:cred:${input.credLabel}`;
@@ -340,6 +353,16 @@ export class ProjectRoom extends DurableObject<Env> {
       this.idemPut(idemScope, input.key, { status: 200, body });
       return { status: 200, body: { ...body, token: input.token } };
     });
+  }
+
+  /** True when the agent or an ancestor joined with this orchestrator credential label. */
+  private inChainOf(a: AgentRow, label: string): boolean {
+    let cur: AgentRow | undefined = a;
+    for (let d = 0; cur && d < 50; d++) {
+      if ((cur as { cred_label?: unknown }).cred_label === label) return true;
+      cur = cur.parent_id ? this.agent(cur.parent_id) : undefined;
+    }
+    return false;
   }
 
   /** Completes an idempotent join replay: store the hash of the rotated token. */
@@ -463,7 +486,7 @@ export class ProjectRoom extends DurableObject<Env> {
         agent_name: me.name,
         parent_name: info.parent_name,
         token_prefix: info.token_prefix ?? undefined,
-        detail: `flooding, third step: warned, then read-only, then revoked`,
+        detail: `flooding, third step: warned, then read-only, then revoked${orphanNote(info)}`,
         descendants: info.descendants,
       },
     };
@@ -503,7 +526,7 @@ export class ProjectRoom extends DurableObject<Env> {
         agent_name: me.name,
         parent_name: info.parent_name,
         token_prefix: info.token_prefix ?? undefined,
-        detail: `${n} times in an hour: ${detail}`,
+        detail: `${n} times in an hour: ${detail}${orphanNote(info)}`,
         descendants: info.descendants,
       },
     };
@@ -525,6 +548,8 @@ export class ProjectRoom extends DurableObject<Env> {
         return this.claim(me, body, now);
       case "release":
         return this.release(me, body, now);
+      case "adopt":
+        return this.adopt(me, body, now);
       case "leave":
         return this.leave(me, now);
       case "whoami":
@@ -660,6 +685,13 @@ export class ProjectRoom extends DurableObject<Env> {
     const scopes = rawScopes.map((s) => str(s, "scope", LIMITS.scopeChars, true));
     const leaseMs = body.lease === undefined ? LIMITS.defaultLeaseMs : leaseOf(body.lease);
 
+    if (me.orphaned) {
+      throw new HttpError(403, { error: "orphaned", detail: "your parent's token was revoked; you can say, sync, heartbeat and release, but not claim until an orchestrator adopts you" });
+    }
+    const lock = this.first<{ until: number }>("SELECT until FROM claim_lock WHERE agent_id = ?", me.id);
+    if (lock && lock.until > now) {
+      throw new HttpError(403, { error: "claim_locked", detail: "too many refused claims: claiming is paused, everything else still works", until: lock.until, retry_after_s: Math.ceil((lock.until - now) / 1000) });
+    }
     const live = this.rows<ClaimRow>("SELECT * FROM claims WHERE state = 'live'");
     const mine = live.find((c) => c.task_id === taskId && c.owner_id === me.id);
     if (mine) return { status: 200, body: claimBody(mine, "already yours") };
@@ -674,7 +706,10 @@ export class ProjectRoom extends DurableObject<Env> {
       const theirs: string[] = JSON.parse(c.scopes);
       for (const s of scopes) {
         const hit = theirs.find((t) => scopesOverlap(s, t));
-        if (hit) return { status: 409, body: { ...holderOf(c), reason: "scope overlap", scope: s, overlaps: hit } };
+        if (hit) {
+          this.claimFight(me, now);
+          return { status: 409, body: { ...holderOf(c), reason: "scope overlap", scope: s, overlaps: hit } };
+        }
       }
     }
     const version = this.counter("claim_version");
@@ -692,6 +727,39 @@ export class ProjectRoom extends DurableObject<Env> {
     const out: Record<string, unknown> = { claim_id: id, version, task_id: taskId, scopes, expires_at: expires, lease_s: leaseMs / 1000 };
     if (openDeps.length) out.warning = `depends on tasks not done: ${openDeps.join(", ")}`;
     return { status: 200, body: out };
+  }
+
+  /**
+   * Fighting over claims, per agent: 10 refused scope claims in 10 minutes pause that agent's
+   * claiming for 15 minutes. Say, sync, heartbeat and release keep working; nothing else is touched.
+   */
+  private claimFight(me: AgentRow, now: number): void {
+    this.sql.exec("INSERT INTO strikes (agent_id, kind, at) VALUES (?, 'claim', ?)", me.id, now);
+    const n = this.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM strikes WHERE agent_id = ? AND kind = 'claim' AND at > ?",
+      me.id, now - LIMITS.claimFightWindowMs,
+    )!.n;
+    if (n < LIMITS.claimFightRefusals) return;
+    this.sql.exec("DELETE FROM strikes WHERE agent_id = ? AND kind = 'claim'", me.id);
+    this.sql.exec(
+      "INSERT INTO claim_lock (agent_id, until) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET until = excluded.until",
+      me.id, now + LIMITS.readOnlyMs,
+    );
+    const parent = this.nameOf(me.parent_id);
+    this.moderatorSay(`@${me.name}${parent ? ` @${parent}` : ""} ${me.name} had ${LIMITS.claimFightRefusals} claims refused in 10 minutes and cannot claim for 15 minutes. Say, sync, heartbeat and release still work.`, now);
+  }
+
+  /** An orchestrator (an agent with no parent) takes an orphaned subagent as its own. */
+  private adopt(me: AgentRow, body: Record<string, unknown>, now: number): Result {
+    if (me.parent_id) throw new HttpError(403, { error: "not_an_orchestrator", detail: "only an agent with no parent can adopt" });
+    const ref = str(body.agent_id, "agent_id", 60, true);
+    const t = this.first<AgentRow>("SELECT * FROM agents WHERE id = ? AND state = 'active'", ref) ??
+      this.first<AgentRow>("SELECT * FROM agents WHERE name = ? AND state = 'active' AND orphaned = 1 ORDER BY joined_at DESC LIMIT 1", ref);
+    if (!t) throw new HttpError(404, { error: "unknown_agent" });
+    if (!t.orphaned) throw new HttpError(409, { error: "not_orphaned" });
+    this.sql.exec("UPDATE agents SET parent_id = ?, orphaned = 0, tree_seen = ? WHERE id = ?", me.id, now, t.id);
+    this.event("roster", t.id, me.id, null, { name: t.name, state: "adopted", parent: me.name });
+    return { status: 200, body: { ok: true, adopted: t.name } };
   }
 
   private release(me: AgentRow, body: Record<string, unknown>, now: number): Result {
@@ -800,6 +868,7 @@ export class ProjectRoom extends DurableObject<Env> {
         task: this.currentTask(a.id),
         status: a.status_line || undefined,
         state: a.roster_state,
+        orphaned: a.orphaned ? true : undefined,
         idle_min: Math.floor((now - a.last_seen) / 60_000),
       }));
     const claims = this.rows<ClaimRow>("SELECT * FROM claims WHERE state = 'live' ORDER BY created_at").map((c) => ({
@@ -817,26 +886,20 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private revokeTree(agentId: string, ban: boolean, rule: number, now: number): RevokeInfo {
     const a = this.agent(agentId);
-    if (!a) return { found: false, agent_id: agentId, agent_name: null, parent_name: null, token_prefix: null, descendants: [] };
-    const descendants: string[] = [];
-    const drop = (x: AgentRow, state: string, reason: string) => {
-      for (const c of this.liveClaimsOf(x.id)) {
-        this.sql.exec("UPDATE claims SET state = 'revoked' WHERE id = ?", c.id);
-        this.sql.exec("UPDATE tasks SET state = 'open', owner_id = NULL, updated_at = ? WHERE id = ? AND owner_id = ?", now, c.task_id, x.id);
-        this.event("claim_expired", c.id, x.id, c.task_id, { task: c.task_id, owner: x.name, claim_id: c.id, reason });
-      }
-      this.sql.exec("UPDATE agents SET state = ?, task_id = NULL WHERE id = ?", state, x.id);
-      this.event("roster", x.id, x.id, null, { name: x.name, state: "removed", reason });
-    };
-    drop(a, ban ? "banned" : "revoked", ban ? `banned under rule ${rule}` : "token revoked");
-    const queue = [a.id];
-    while (queue.length) {
-      const pid = queue.shift()!;
-      for (const c of this.rows<AgentRow>("SELECT * FROM agents WHERE parent_id = ? AND state = 'active'", pid)) {
-        drop(c, "revoked", `parent ${a.name} ${ban ? "banned" : "revoked"}`);
-        descendants.push(c.name);
-        queue.push(c.id);
-      }
+    if (!a) return { found: false, agent_id: agentId, agent_name: null, parent_name: null, token_prefix: null, descendants: [], orphans: [] };
+    const orphans: string[] = [];
+    for (const c of this.liveClaimsOf(a.id)) {
+      this.sql.exec("UPDATE claims SET state = 'revoked' WHERE id = ?", c.id);
+      this.sql.exec("UPDATE tasks SET state = 'open', owner_id = NULL, updated_at = ? WHERE id = ? AND owner_id = ?", now, c.task_id, a.id);
+      this.event("claim_expired", c.id, a.id, c.task_id, { task: c.task_id, owner: a.name, claim_id: c.id, reason: ban ? `banned under rule ${rule}` : "token revoked" });
+    }
+    this.sql.exec("UPDATE agents SET state = ?, task_id = NULL WHERE id = ?", ban ? "banned" : "revoked", a.id);
+    this.event("roster", a.id, a.id, null, { name: a.name, state: "removed", reason: ban ? `banned under rule ${rule}` : "token revoked" });
+    // Subagents are not punished for their parent: they stay, marked orphaned, until adopted.
+    for (const c of this.rows<AgentRow>("SELECT * FROM agents WHERE parent_id = ? AND state = 'active'", a.id)) {
+      this.sql.exec("UPDATE agents SET orphaned = 1 WHERE id = ?", c.id);
+      this.event("roster", c.id, c.id, null, { name: c.name, state: "orphaned", reason: `parent ${a.name} revoked` });
+      orphans.push(c.name);
     }
     return {
       found: true,
@@ -844,7 +907,8 @@ export class ProjectRoom extends DurableObject<Env> {
       agent_name: a.name,
       parent_name: this.nameOf(a.parent_id),
       token_prefix: a.token_hash.slice(0, 8),
-      descendants,
+      descendants: [],
+      orphans,
     };
   }
 
@@ -853,7 +917,7 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => {
       const a = this.agent(agentId);
       if (!a || (opts.tokenHash && a.token_hash !== opts.tokenHash)) {
-        return { found: false, agent_id: agentId, agent_name: null, parent_name: null, token_prefix: null, descendants: [] };
+        return { found: false, agent_id: agentId, agent_name: null, parent_name: null, token_prefix: null, descendants: [], orphans: [] };
       }
       return this.revokeTree(agentId, opts.ban, opts.rule, this.now());
     });
@@ -873,6 +937,10 @@ export class ProjectRoom extends DurableObject<Env> {
 }
 
 // ------------------------------------------------------------------ helpers
+
+function orphanNote(info: RevokeInfo): string {
+  return info.orphans.length ? `; subagents left orphaned, not banned: ${info.orphans.join(", ")}` : "";
+}
 
 class SecretRefused extends Error {
   constructor(public reason: string) {

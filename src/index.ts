@@ -27,7 +27,7 @@ export interface Env {
   BLOCK_CACHE_MS?: string;
 }
 
-const ROOM_CALLS = new Set(["heartbeat", "sync", "say", "board", "task", "claim", "release", "leave", "whoami"]);
+const ROOM_CALLS = new Set(["heartbeat", "sync", "say", "board", "task", "claim", "release", "leave", "whoami", "adopt"]);
 const GET_CALLS = new Set(["sync", "board", "whoami"]);
 const MAX_BODY = 64 * 1024;
 
@@ -87,7 +87,7 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
 
 async function ban(env: Env, input: BanInput): Promise<Response> {
   const rec = await moderator(env).ban(input);
-  noteBlock(input.ip, rec.blocked_until);
+  if (input.rule === 6) return json({ error: "forged_ancestry", rule: 6, ban_id: rec.id, detail: input.detail }, 403);
   return json({ error: "banned", rule: input.rule, ban_id: rec.id }, 403);
 }
 
@@ -120,20 +120,29 @@ async function handleJoin(env: Env, req: Request, project: string, ip: string, p
   let parentId: string | null = null;
   let parentTokenHash: string | null = null;
 
-  if (typeof body.orchestrator_credential === "string" && body.orchestrator_credential) {
+  const hasCred = typeof body.orchestrator_credential === "string" && body.orchestrator_credential !== "";
+  const hasParent = typeof body.parent_token === "string" && body.parent_token !== "";
+  // A join without a credential is counted toward the address slowdown (tokenless calls), never a block.
+  const refuse1 = async (detail: string) => {
+    const res = await ban(env, { rule: 1, project, ip, path, agent_name: name || null, detail });
+    await moderator(env).strike(ip, path, null, detail);
+    return res;
+  };
+
+  if (hasCred) {
     for (const [label, cred] of Object.entries(jsonMap(env.ORCHESTRATOR_CREDENTIALS))) {
-      if (await safeEqual(body.orchestrator_credential, cred)) credLabel = label;
+      if (await safeEqual(body.orchestrator_credential as string, cred)) credLabel = label;
     }
-    if (!credLabel) return ban(env, { rule: 1, project, ip, path, agent_name: name || null, detail: "orchestrator credential not valid" });
-  } else if (typeof body.parent_token === "string" && body.parent_token) {
-    const pt = parseToken(body.parent_token);
-    if (!pt) return ban(env, { rule: 1, project, ip, path, agent_name: name || null, detail: "parent token malformed" });
+    if (!credLabel) return refuse1("orchestrator credential not valid");
+  }
+  if (hasParent) {
+    const pt = parseToken(body.parent_token as string);
+    if (!pt) return refuse1("parent token malformed");
     parentTokenHash = await sha256(pt.raw);
     if (pt.project !== project) return crossProject(env, pt.project, pt.agentId, parentTokenHash, project, ip, path);
     parentId = pt.agentId;
-  } else {
-    return ban(env, { rule: 1, project, ip, path, agent_name: name || null, detail: "no orchestrator credential or parent token" });
   }
+  if (!hasCred && !hasParent) return refuse1("no orchestrator credential or parent token");
 
   const agentId = newAgentId();
   const token = makeToken(project, agentId);
@@ -143,7 +152,6 @@ async function handleJoin(env: Env, req: Request, project: string, ip: string, p
   if (r.violation) {
     return ban(env, { rule: r.violation.rule, project, ip, path, agent_name: name || null, parent_name: r.violation.parent_name ?? null, detail: r.violation.detail });
   }
-  if (r.badToken) return strike(env, ip, path, parentTokenHash?.slice(0, 8) ?? null, "join under a parent that is gone", fromResult(r));
   if (r.rotateFor) {
     const fresh = makeToken(project, r.rotateFor);
     await stub.rotateToken(r.rotateFor, await sha256(fresh));
@@ -152,13 +160,14 @@ async function handleJoin(env: Env, req: Request, project: string, ip: string, p
   return fromResult(r);
 }
 
-/** Rule 3: a token used against a project it was not issued for. */
+/** Rule 3: a token used against a project it was not issued for. That token is revoked; the address is not touched. */
 async function crossProject(env: Env, home: string, agentId: string, tokenHash: string, project: string, ip: string, path: string): Promise<Response> {
   const keys = jsonMap(env.PROJECT_KEYS);
   let info = null;
   if (keys[home] !== undefined) {
     info = await room(env, home).revoke(agentId, { ban: true, rule: 3, tokenHash });
   }
+  const orphans = info?.orphans ?? [];
   return ban(env, {
     rule: 3,
     project,
@@ -168,8 +177,7 @@ async function crossProject(env: Env, home: string, agentId: string, tokenHash: 
     agent_name: info?.agent_name ?? null,
     parent_name: info?.parent_name ?? null,
     token_prefix: tokenHash.slice(0, 8),
-    descendants: info?.descendants ?? [],
-    detail: `token issued for project ${home}${info?.found ? "" : " (no such agent there)"}`,
+    detail: `token issued for project ${home}${info?.found ? "" : " (no such agent there)"}${orphans.length ? `; subagents left orphaned, not banned: ${orphans.join(", ")}` : ""}`,
   });
 }
 

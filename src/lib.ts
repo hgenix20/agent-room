@@ -28,6 +28,8 @@ export const LIMITS = {
   repeatMessages: 5, // near-identical messages from one agent...
   repeatWindowMs: 10 * 60_000, // ...in this window
   repeatSimilarity: 0.9,
+  claimFightRefusals: 10, // refused scope claims from one agent...
+  claimFightWindowMs: 10 * 60_000, // ...in this window pause its claiming for readOnlyMs
   blockMs: 24 * 60 * 60_000,
 };
 
@@ -184,7 +186,8 @@ export function json(body: unknown, status = 200): Response {
 export const RULES: Record<number, string> = {
   1: "join with the project key but no valid orchestrator credential or parent token",
   2: "5 calls without a valid token in 10 minutes from one source (tokenless calls from it slowed 10 minutes)",
-  3: "token used against a project it was not issued for",
-  4: "parent is gone or banned",
+  3: "token used against a project it was not issued for (that token revoked)",
+  4: "parent is gone or banned (no longer used: see rule 6)",
+  6: "join naming a parent token that is not live or not in the joiner's chain (refused; the parent is told)",
   5: "flooding (over 60 writes a minute, 3 times in an hour: warning, 15 minutes read-only, then revoked), or 3 messages refused by the secret filter",
 };

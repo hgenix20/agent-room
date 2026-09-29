@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { admin, advance, get, joinOrch, joinSub, newIp, post, req, uid } from "./helpers";
+import { admin, advance, get, joinOrch, joinSub, newIp, newTask, post, req, uid } from "./helpers";
 import { secretReason, scopesOverlap } from "../src/lib";
 
 const P = "genix";
@@ -18,10 +18,9 @@ describe("ban rules", () => {
     expect(r.body.rule).toBe(1);
     const ban = await banById(r.body.ban_id);
     expect(ban).toMatchObject({ rule: 1, ip, agent_name: "intruder", project: P });
-    // the source is blocked for 24 hours, even with a good credential
-    const again = await req(`/p/${P}/join`, { ip, body: { name: "x", model: "m", project_key: "test-key-genix", orchestrator_credential: "orch-cred-box" } });
-    expect(again.status).toBe(403);
-    expect(again.body.error).toBe("blocked");
+    // the source is not blocked: a holder of a good credential on the same address still joins
+    const again = await req(`/p/${P}/join`, { ip, body: { name: uid("ok"), model: "m", project_key: "test-key-genix", orchestrator_credential: "orch-cred-box" } });
+    expect(again.status).toBe(200);
     // the moderation channel carries the notice, recommending key rotation
     const mod = await admin("/admin/moderation?since=0", undefined, "mind-test-token");
     const note = mod.body.messages.find((m: any) => m.ban_id === ban.id);
@@ -36,7 +35,8 @@ describe("ban rules", () => {
     const forged = o.token.slice(0, -4) + "AAAA";
     const f = await req(`/p/${P}/join`, { ip: newIp(), body: { name: "y", model: "m", project_key: "test-key-genix", parent_token: forged } });
     expect(f.status).toBe(403);
-    expect(f.body.rule).toBe(1);
+    expect(f.body.error).toBe("forged_ancestry");
+    expect(f.body.rule).toBe(6);
   });
 
   it("rule 2: five tokenless calls in ten minutes slow the source, they do not block it", async () => {
@@ -79,38 +79,16 @@ describe("ban rules", () => {
     expect(fifth.body.rule).toBe(2);
   });
 
-  it("rule 3: a token used against another project", async () => {
-    const o = await joinOrch(P, uid("r3"));
-    const s = await joinSub(o, uid("r3s"), newIp());
-    const r = await req(`/p/other/sync`, { ip: o.ip, token: o.token });
-    expect(r.status).toBe(403);
-    expect(r.body.rule).toBe(3);
-    const ban = await banById(r.body.ban_id);
-    expect(ban).toMatchObject({ rule: 3, agent_name: o.name, project: "other" });
-    expect(ban.descendants).toContain(s.name);
-    // revoked at home too, and its subagent with it (checked from clean sources)
-    expect((await req(`/p/${P}/sync`, { ip: newIp(), token: o.token })).status).toBe(401);
-    expect((await get(s, "sync")).status).toBe(401);
-  });
-
-  it("rule 4: joining under a banned parent", async () => {
-    const o = await joinOrch(P, uid("r4"));
-    await req(`/p/other/board`, { ip: o.ip, token: o.token }); // rule 3 bans the parent
-    const ip = newIp();
-    const r = await req(`/p/${P}/join`, { ip, body: { name: uid("r4s"), model: "m", project_key: "test-key-genix", parent_token: o.token } });
-    expect(r.status).toBe(403);
-    expect(r.body.rule).toBe(4);
-    expect((await banById(r.body.ban_id)).parent_name).toBe(o.name);
-  });
-
-  it("rule 4: a parent gone quiet takes its subagents' tokens with it; a join under it is refused", async () => {
+  it("a parent gone quiet takes its subagents' tokens with it; a join under it is refused without a block", async () => {
     const o = await joinOrch(P, uid("r4g"));
     const s = await joinSub(o, uid("r4gs"));
     await advance(P, 31 * 60_000);
     expect((await get(s, "sync")).status).toBe(401);
-    const j = await req(`/p/${P}/join`, { ip: newIp(), body: { name: uid("late"), model: "m", project_key: "test-key-genix", parent_token: o.token } });
-    expect(j.status).toBe(401);
-    expect(j.body.error).toBe("parent_gone");
+    const ip = newIp();
+    const j = await req(`/p/${P}/join`, { ip, body: { name: uid("late"), model: "m", project_key: "test-key-genix", parent_token: o.token } });
+    expect(j.status).toBe(403);
+    expect(j.body.error).toBe("forged_ancestry");
+    expect((await joinOrch(P, uid("after"), ip)).token).toBeTruthy();
   });
 
   it("a working subagent keeps its quiet orchestrator alive", async () => {
@@ -141,7 +119,7 @@ describe("ban rules", () => {
       expect((await flood()).status).toBe(429);
       await advance(P, 61_000);
     }
-    const warn = (await get(bystander, "sync", "?since=0&limit=500")).body.events.filter((e: any) => e.by === "moderator");
+    const warn = (await get(bystander, "sync", "?since=0&limit=500")).body.events.filter((e: any) => e.by === "moderator" && (e.mentions ?? []).includes(a.name));
     expect(warn.length).toBe(1);
     expect(warn[0].mentions).toEqual(expect.arrayContaining([a.name, parent.name]));
     expect((await post(a, "say", { text: "after warning" })).status).toBe(200);
@@ -265,6 +243,149 @@ describe("ban rules", () => {
     expect((await post(bystander, "say", { text: "still fine" })).status).toBe(200);
   });
 
+});
+
+describe("increment 3: claims, wrong project, ancestry, orphans", () => {
+  const scopeClaim = (a: any, t: string, sc: string) => post(a, "claim", { task_id: t, scopes: [sc] });
+
+  async function fighter() {
+    const o = await joinOrch(P, uid("cf-o"));
+    const holder = await joinSub(o, uid("cf-h"));
+    const a = await joinSub(o, uid("cf-a"));
+    const held = uid("held");
+    expect((await scopeClaim(holder, await newTask(o, "held"), held)).status).toBe(200);
+    return { o, a, held };
+  }
+
+  it("claim fighting: 9 refusals are fine, the 10th pauses claiming for 15 minutes, then it lifts", async () => {
+    const { o, a, held } = await fighter();
+    for (let i = 0; i < 9; i++) expect((await scopeClaim(a, await newTask(o, `f${i}`), held)).status).toBe(409);
+    const t10 = await newTask(o, "ten");
+    expect((await scopeClaim(a, t10, held)).status).toBe(409); // the 10th refusal itself
+    const locked = await scopeClaim(a, await newTask(o, "free"), uid("free"));
+    expect(locked.status).toBe(403);
+    expect(locked.body.error).toBe("claim_locked");
+    // everything else still works
+    expect((await post(a, "say", { text: "still talking" })).status).toBe(200);
+    expect((await get(a, "sync")).status).toBe(200);
+    expect((await post(a, "heartbeat", { status_line: "waiting" })).status).toBe(200);
+    // one minute short of 15: still locked
+    await advance(P, 14 * 60_000);
+    expect((await scopeClaim(a, await newTask(o, "free2"), uid("free"))).status).toBe(403);
+    await advance(P, 61_000);
+    expect((await scopeClaim(a, await newTask(o, "free3"), uid("free"))).status).toBe(200);
+  });
+
+  it("claim fighting: 9 refused claims leave claiming open, and the count is per agent", async () => {
+    const { o, a, held } = await fighter();
+    const other = await joinSub(o, uid("cf-b"));
+    for (let i = 0; i < 9; i++) expect((await scopeClaim(a, await newTask(o, `g${i}`), held)).status).toBe(409);
+    expect((await scopeClaim(a, await newTask(o, "ok"), uid("free"))).status).toBe(200);
+    expect((await scopeClaim(other, await newTask(o, "ok2"), uid("free"))).status).toBe(200);
+  });
+
+  it("claim fighting: refusals older than ten minutes do not count", async () => {
+    const { o, a, held } = await fighter();
+    for (let i = 0; i < 9; i++) expect((await scopeClaim(a, await newTask(o, `h${i}`), held)).status).toBe(409);
+    await advance(P, 11 * 60_000);
+    expect((await scopeClaim(a, await newTask(o, "late"), held)).status).toBe(409); // holder's lease may have lapsed
+    expect((await scopeClaim(a, await newTask(o, "free"), uid("free"))).status).toBe(200);
+  });
+
+  it("wrong project: the token is revoked with a ban row, a same-address neighbour keeps working", async () => {
+    const o = await joinOrch(P, uid("wp-o"));
+    const a = await joinSub(o, uid("wp-a"));
+    const neighbour = await joinSub(o, uid("wp-n"), a.ip);
+    const r = await req(`/p/other/sync`, { ip: a.ip, token: a.token });
+    expect(r.status).toBe(403);
+    expect(r.body.rule).toBe(3);
+    const ban = await banById(r.body.ban_id);
+    expect(ban).toMatchObject({ rule: 3, agent_name: a.name, project: "other" });
+    expect(ban.blocked_until).toBeLessThanOrEqual(ban.at);
+    expect((await req(`/p/${P}/sync`, { ip: newIp(), token: a.token })).status).toBe(401);
+    expect((await get(neighbour, "sync")).status).toBe(200);
+    expect((await post(neighbour, "say", { text: "unaffected" })).status).toBe(200);
+    // and a fresh join from that address works
+    expect((await joinSub(o, uid("wp-new"), a.ip)).token).toBeTruthy();
+  });
+
+  it("forged ancestry: a parent token that is not live is refused, the parent is told, the address is free", async () => {
+    const o = await joinOrch(P, uid("fa-o"));
+    const p = await joinSub(o, uid("fa-p"));
+    const ip = newIp();
+    const forged = p.token.slice(0, -4) + "AAAA";
+    const r = await req(`/p/${P}/join`, { ip, body: { name: uid("fa-x"), model: "m", project_key: "test-key-genix", parent_token: forged } });
+    expect(r.status).toBe(403);
+    expect(r.body.error).toBe("forged_ancestry");
+    const sync = await get(p, "sync", "?only=mentions");
+    const told = sync.body.events.find((e: any) => e.kind === "say" && e.by === "moderator");
+    expect(told.text).toContain(`@${p.name}`);
+    expect(told.text).toContain("join was refused");
+    // revoked parent: refused too
+    await admin("/admin/revoke", { project: P, agent: p.name });
+    const r2 = await req(`/p/${P}/join`, { ip, body: { name: uid("fa-y"), model: "m", project_key: "test-key-genix", parent_token: p.token } });
+    expect(r2.status).toBe(403);
+    expect(r2.body.error).toBe("forged_ancestry");
+    // the address was never blocked
+    expect((await joinOrch(P, uid("fa-fine"), ip)).token).toBeTruthy();
+  });
+
+  it("forged ancestry: a parent outside the joiner's own chain is refused", async () => {
+    const mine = await joinOrch(P, uid("ch-o"));
+    const theirs = await joinOrch(P, uid("ch-t"), newIp(), "orch-cred-laptop");
+    const body = (parent: any) => ({ name: uid("ch-s"), model: "m", project_key: "test-key-genix", orchestrator_credential: "orch-cred-box", parent_token: parent.token });
+    const bad = await req(`/p/${P}/join`, { ip: newIp(), body: body(theirs) });
+    expect(bad.status).toBe(403);
+    expect(bad.body.error).toBe("forged_ancestry");
+    const good = await req(`/p/${P}/join`, { ip: newIp(), body: body(mine) });
+    expect(good.status).toBe(200);
+  });
+
+  it("revoking a parent orphans its subagent: it can release but not claim, and claims again once adopted", async () => {
+    const o = await joinOrch(P, uid("or-o"));
+    const p = await joinSub(o, uid("or-p"));
+    const kid = await joinSub(p, uid("or-k"));
+    const t = await newTask(o, "held by kid");
+    const c = await post(kid, "claim", { task_id: t, scopes: [uid("or")] });
+    expect(c.status).toBe(200);
+    const rv = await admin("/admin/revoke", { project: P, agent: p.name });
+    expect(rv.body.revoked.orphans).toEqual([kid.name]);
+    expect((await get(p, "sync")).status).toBe(401);
+    // the orphan is still here and marked
+    const sync = await get(kid, "sync");
+    expect(sync.status).toBe(200);
+    expect(sync.body.roster.find((r: any) => r.name === kid.name).orphaned).toBe(true);
+    expect((await post(kid, "say", { text: "still here" })).status).toBe(200);
+    expect((await post(kid, "heartbeat", {})).status).toBe(200);
+    // no new claims
+    const blocked = await post(kid, "claim", { task_id: await newTask(o, "new"), scopes: [uid("or2")] });
+    expect(blocked.status).toBe(403);
+    expect(blocked.body.error).toBe("orphaned");
+    // but it may release what it holds
+    const rel = await post(kid, "release", { claim_id: c.body.claim_id, version: c.body.version, state: "done" });
+    expect(rel.status).toBe(200);
+    // a subagent cannot adopt; an orchestrator can
+    const other = await joinSub(o, uid("or-s"));
+    expect((await post(other, "adopt", { agent_id: kid.id })).status).toBe(403);
+    expect((await post(o, "adopt", { agent_id: uid("nobody") })).status).toBe(404);
+    const ad = await post(o, "adopt", { agent_id: kid.id });
+    expect(ad.status).toBe(200);
+    expect((await post(o, "adopt", { agent_id: kid.id })).body.error).toBe("not_orphaned");
+    const again = await post(kid, "claim", { task_id: await newTask(o, "after"), scopes: [uid("or3")] });
+    expect(again.status).toBe(200);
+    const roster = (await get(kid, "sync")).body.roster.find((r: any) => r.name === kid.name);
+    expect(roster.parent).toBe(o.name);
+    expect(roster.orphaned).toBeUndefined();
+  });
+
+  it("a rule-revoked parent (wrong project) leaves its subagents orphaned, not banned", async () => {
+    const o = await joinOrch(P, uid("ow-o"));
+    const kid = await joinSub(o, uid("ow-k"));
+    const r = await req(`/p/other/sync`, { ip: newIp(), token: o.token });
+    expect(r.body.rule).toBe(3);
+    expect((await banById(r.body.ban_id)).detail).toContain(kid.name);
+    expect((await get(kid, "sync")).status).toBe(200);
+  });
 });
 
 describe("admin", () => {

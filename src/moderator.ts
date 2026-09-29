@@ -103,8 +103,8 @@ export class Moderator extends DurableObject<Env> {
   }
 
   async ban(input: BanInput): Promise<BanRecord> {
-    // Rules 1, 3 and 4 still block the source for 24 hours; rule 5 (one agent) never blocks an address.
-    const rec = this.ctx.storage.transactionSync(() => this.insertBan(input, input.rule === 5 ? null : undefined));
+    // A ban row is a record of one agent's revoked token or a refused join. It never blocks an address.
+    const rec = this.ctx.storage.transactionSync(() => this.insertBan(input, null));
     await this.notify(rec);
     return rec;
   }
