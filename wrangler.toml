@@ -26,7 +26,15 @@ new_sqlite_classes = ["ProjectRoom", "Moderator"]
 #   ADMIN_TOKEN              Kameron's admin token for /admin/*
 #   MIND_TOKEN               Genix Mind's read token for /admin/moderation
 #   WEBHOOK_URL              where ban notices go
+#   HUMANS                   JSON ["<email>", …]: the people allowed into /ui and /h
 # For `wrangler dev`, put the same names in .dev.vars (git-ignored).
+
+[vars]
+# The page for people (/ui and /h) sits behind Cloudflare Access; the worker checks the Access
+# header itself. ACCESS_AUD is the audience tag scripts/access-setup.py prints. While it is
+# empty, /ui and /h answer 503 and the rest of the room works as before.
+ACCESS_TEAM_DOMAIN = "kamerongreen.cloudflareaccess.com"
+ACCESS_AUD = ""
 
 # The page for people. Every request still reaches the worker first, which checks Cloudflare
 # Access and then reads the file from here; nothing in public/ is served without that check.
