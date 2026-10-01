@@ -105,6 +105,7 @@ const fire = (t: Timer): void => {
 const STATUS_SEQ = 101;
 let head = 100;
 let duringNextSince: (() => void) | null = null;
+let sayAnswer: "ok" | "refuse" | "throw" = "ok";
 const requests: string[] = [];
 const event = (seq: number) =>
   seq === STATUS_SEQ
@@ -123,6 +124,10 @@ async function stubFetch(path: string) {
   if (url.pathname === "/h/genix/me") return answer({ name: "kameron", kind: "human" });
   if (url.pathname === "/h/genix/board") return answer({ tasks: [] });
   if (url.pathname === "/h/genix/heartbeat") return answer({ ok: true });
+  if (url.pathname === "/h/genix/say") {
+    if (sayAnswer === "throw") throw new Error("network down");
+    return sayAnswer === "refuse" ? { type: "basic", status: 400, json: async () => ({ error: "too_long" }) } : answer({ seq: 1 });
+  }
   if (url.pathname === "/h/genix/sync") {
     const before = url.searchParams.get("before");
     if (before !== null) return answer({ cursor: head, more: false, events: range(1, Math.min(head, Number(before) - 1)), roster: [], claims: [] });
@@ -161,7 +166,8 @@ beforeAll(async () => {
   const g = globalThis as any;
   for (const k of GLOBALS) saved[k] = g[k];
   g.document = { getElementById: (id: string) => nodes[id], createElement: (tag: string) => new Node(tag) };
-  g.location = { protocol: "https:", host: "room.test", hash: "", reload() {} };
+  // A malformed % in the hash falls back to the first project.
+  g.location = { protocol: "https:", host: "room.test", hash: "#%zz", reload() {} };
   g.WebSocket = StubSocket;
   g.fetch = stubFetch;
   g.setTimeout = (fn: () => void, ms: number) => addTimer(fn, ms, false);
@@ -249,6 +255,24 @@ describe("the page's network code", () => {
     expect(rows[1].dataset.seq).toBeUndefined();
     expect(rows[1].textContent).toMatch(/^\u00a0+ \u2506 12:01 <kameron> approved$/);
     expect(rows[1].elements.some((n) => n.className === "gut")).toBe(true);
+  });
+
+  it("the input is cleared only when the room takes the line, and a refused line comes back", async () => {
+    const send = async (text: string, clearMeanwhile = false) => {
+      nodes.input.value = text;
+      for (const fn of nodes.inputform.listeners.submit) fn({ preventDefault() {} });
+      if (clearMeanwhile) nodes.input.value = "";
+      await settle();
+    };
+    sayAnswer = "refuse";
+    await send("refuse me");
+    expect(nodes.input.value).toBe("refuse me");
+    sayAnswer = "throw";
+    await send("no answer", true);
+    expect(nodes.input.value).toBe("no answer");
+    sayAnswer = "ok";
+    await send("hello");
+    expect(nodes.input.value).toBe("");
   });
 
   it("a failed catch-up leaves the page off live and closes the socket so it retries", async () => {

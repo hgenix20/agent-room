@@ -288,7 +288,16 @@ export class ProjectRoom extends DurableObject<Env> {
     const project = req.headers.get("x-room-project") ?? "";
     if (!email || !project) return json({ error: "access_required" }, 403);
     this.project = project;
-    if (this.openSockets().length >= LIMITS.maxSockets) return json({ error: "too_many_sockets" }, 429);
+    const open = this.openSockets();
+    if (open.length >= LIMITS.maxSockets) {
+      // At the cap, a person's newest tab replaces their oldest; only other people's sockets refuse it.
+      const known = this.first<{ id: string }>("SELECT id FROM agents WHERE kind = 'human' AND email = ?", email);
+      const theirs = known ? this.openSockets(known.id) : [];
+      if (!theirs.length) return json({ error: "too_many_sockets" }, 429);
+      const openedAt = (ws: WebSocket) => (ws.deserializeAttachment() as { at?: number } | null)?.at ?? 0;
+      const oldest = theirs.reduce((a, b) => (openedAt(b) < openedAt(a) ? b : a));
+      oldest.close(1000, "replaced by a newer tab");
+    }
     const me = this.commit((): AgentRow => {
       const now = this.now();
       this.sweep(now);
@@ -298,6 +307,7 @@ export class ProjectRoom extends DurableObject<Env> {
     });
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [me.id]);
+    pair[1].serializeAttachment({ at: Date.now() });
     pair[1].send(JSON.stringify({ type: "hello", cursor: this.head() }));
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -635,6 +645,8 @@ export class ProjectRoom extends DurableObject<Env> {
     if (reserved(name) || this.nameTaken(name, now, me.id)) throw new HttpError(409, { error: "name_taken", name });
     this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", name, me.id);
     this.event("roster", me.id, me.id, null, { name, state: "renamed", was: me.name });
+    // The grid shows each task's owner by name, so every task this person owns goes out again.
+    for (const t of this.rows<{ id: string }>("SELECT id FROM tasks WHERE owner_id = ?", me.id)) this.dirtyTasks.add(t.id);
     return { status: 200, body: { name } };
   }
 
@@ -679,7 +691,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const parent = this.nameOf(me.parent_id);
       this.moderatorSay(
         `@${me.name}${parent ? ` @${parent}` : ""} warning: ${me.name} went over ${LIMITS.writesPerMinute} writes a minute ${LIMITS.floodStrikes} times in an hour. ` +
-          `The next ${LIMITS.floodStrikes} makes it read-only for 15 minutes, and after that its token is revoked.`,
+          (me.kind === "human"
+            ? `The next ${LIMITS.floodStrikes} makes it read-only for 15 minutes.`
+            : `The next ${LIMITS.floodStrikes} makes it read-only for 15 minutes, and after that its token is revoked.`),
         now,
       );
       return null;

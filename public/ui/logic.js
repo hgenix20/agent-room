@@ -4,7 +4,7 @@
 export const PRIORITIES = ["urgent", "high", "normal", "low"];
 
 export const HELP =
-  '/task add "title" [pri:high] [est:45m] [60k] · /pri T7 urgent · /est T8 90m 70k · /claim T7 [scope …] · /release T7 done|blocked · /nick name · /project name · /help';
+  '/task add "title" [pri:high] [est:45m] [60k] \u00b7 /pri T7 urgent \u00b7 /est T8 90m 70k \u00b7 /claim T7 [scope \u2026] \u00b7 /release T7 done|blocked \u00b7 /nick name \u00b7 /project name \u00b7 /help \u00b7 //text sends a line that starts with /';
 
 const MINUTES_MAX = 100000;
 const TOKENS_MAX = 2000000000;
@@ -25,7 +25,8 @@ export function fmtDuration(min) {
 export function fmtTokens(n) {
   if (n === null || n === undefined) return "";
   if (n < 1000) return String(n);
-  const [div, unit] = n < 1000000 ? [1000, "k"] : [1000000, "M"];
+  // 999500 rounds to 1000k, so from there on it is written in millions.
+  const [div, unit] = n < 999500 ? [1000, "k"] : [1000000, "M"];
   const v = n / div;
   return (v < 10 ? v.toFixed(1).replace(/\.0$/, "") : String(Math.round(v))) + unit;
 }
@@ -73,6 +74,7 @@ function words(s) {
 }
 
 const err = (message) => ({ kind: "error", message });
+const CAPITAL_M = "a capital M means million tokens";
 
 /**
  * What the input line means. Text is a message; a line starting with / is a command.
@@ -82,6 +84,8 @@ export function parseCommand(line) {
   const text = String(line).trim();
   if (!text) return { kind: "none" };
   if (!text.startsWith("/")) return { kind: "call", action: "say", body: { text } };
+  // "//" escapes the command slash: the message is the line with one slash removed.
+  if (text.startsWith("//")) return { kind: "call", action: "say", body: { text: text.slice(1) } };
   const w = words(text.slice(1));
   const cmd = (w.shift()?.v ?? "").toLowerCase();
 
@@ -91,7 +95,7 @@ export function parseCommand(line) {
 
   if (cmd === "task") {
     const usage = 'usage: /task add "title" [pri:high] [est:45m] [60k]';
-    if (w.shift()?.v !== "add" || !w.length) return err(usage);
+    if (w.shift()?.v.toLowerCase() !== "add" || !w.length) return err(usage);
     const body = {};
     const title = [];
     for (const x of w) {
@@ -101,6 +105,7 @@ export function parseCommand(line) {
         if (!PRIORITIES.includes(pri[1].toLowerCase())) return err(`priority is one of ${PRIORITIES.join(", ")}`);
         body.priority = pri[1].toLowerCase();
       } else if (est) {
+        if (/M$/.test(est[1])) return err(`est: takes a time such as 45m; ${CAPITAL_M}`);
         const minutes = parseDuration(est[1]);
         if (minutes === null) return err("est: takes a time such as 45m or 1h30m");
         body.estimate_minutes = minutes;
@@ -126,6 +131,7 @@ export function parseCommand(line) {
     if (w.length < 2 || w.length > 3 || !TASK_ID.test(w[0].v)) return err(usage);
     const body = { task_id: w[0].v };
     for (const x of w.slice(1)) {
+      if (/M$/.test(x.v)) return err(`${CAPITAL_M}. write 90m for time or 70k for tokens`);
       if (/[hm]$/.test(x.v)) {
         const minutes = parseDuration(x.v);
         if (minutes === null) return err("that time is not valid. " + usage);
@@ -213,7 +219,7 @@ function changeText(field, to) {
   if (field === "estimate_minutes") return to === null ? null : `estimate to ${fmtDuration(to)}`;
   if (field === "estimate_tokens") return to === null ? null : `token estimate to ${fmtTokens(to)}`;
   if (field === "title") return `title to "${to}"`;
-  return "detail";
+  return field;
 }
 
 const CLEARED = { estimate_minutes: "estimate", estimate_tokens: "token estimate" };
@@ -221,7 +227,13 @@ const CLEARED = { estimate_minutes: "estimate", estimate_tokens: "token estimate
 function updateText(e) {
   const set = [];
   const cleared = [];
+  let detail = false;
   for (const [field, pair] of Object.entries(e.changes ?? {})) {
+    // The event says the detail changed without carrying the text.
+    if (field === "detail") {
+      detail = true;
+      continue;
+    }
     const text = changeText(field, pair[1]);
     if (text === null) cleared.push(CLEARED[field]);
     else set.push(text);
@@ -229,6 +241,7 @@ function updateText(e) {
   const parts = [];
   if (set.length) parts.push(`set ${e.task} ${set.join("; ")}`);
   if (cleared.length) parts.push(`cleared ${e.task} ${cleared.join(" and ")}`);
+  if (detail) parts.push(`changed ${e.task} detail`);
   return `${e.by} ${parts.join("; ")}`;
 }
 

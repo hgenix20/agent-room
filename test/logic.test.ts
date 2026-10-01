@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  actualNow, clean, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents, nickColor,
+  HELP, actualNow, clean, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents, nickColor,
   overEstimate, parseCommand, parseDuration, parseTokens, sortTasks, topicLine,
 } from "../public/ui/logic.js";
 
@@ -25,6 +25,8 @@ describe("formatting", () => {
     expect(fmtTokens(48300)).toBe("48k");
     expect(fmtTokens(1_400_000)).toBe("1.4M");
     expect(fmtTokens(2_000_000)).toBe("2M");
+    expect(fmtTokens(999_499)).toBe("999k");
+    expect(fmtTokens(999_500)).toBe("1M");
   });
 
   it("times show the date only when it is not today", () => {
@@ -94,6 +96,24 @@ describe("parsing what a person types", () => {
     expect(unknown.kind).toBe("error");
     expect(unknown.message).toContain("/task add");
   });
+
+  it("a capital M is million tokens, so est:1M and /est T8 1M are refused", () => {
+    for (const line of ["/task add x est:1M", "/est T8 1M"]) {
+      const r = cmd(line);
+      expect(r.kind).toBe("error");
+      expect(r.message).toContain("a capital M means million tokens");
+    }
+  });
+
+  it("the add of /task add is matched in any case", () => {
+    expect(cmd("/task ADD docs")).toEqual({ kind: "call", action: "task", body: { title: "docs" } });
+    expect(cmd("/TASK Add docs").kind).toBe("call");
+  });
+
+  it("a line starting with // is a message starting with one /", () => {
+    expect(cmd("//etc/hosts is wrong")).toEqual({ kind: "call", action: "say", body: { text: "/etc/hosts is wrong" } });
+    expect(HELP).toContain("//");
+  });
 });
 
 describe("the grid", () => {
@@ -158,6 +178,7 @@ describe("the channel", () => {
     expect(text({ kind: "task_updated", task: "T7", by: "kameron", changes: { priority: ["normal", "urgent"] } })).toBe("kameron set T7 priority to urgent");
     expect(text({ kind: "task_updated", task: "T8", by: "kameron", changes: { estimate_minutes: [60, 90], estimate_tokens: [null, 70000] } })).toBe("kameron set T8 estimate to 1h 30m; token estimate to 70k");
     expect(text({ kind: "task_updated", task: "T8", by: "kameron", changes: { estimate_minutes: [60, null] } })).toBe("kameron cleared T8 estimate");
+    expect(text({ kind: "task_updated", task: "T7", by: "kameron", changes: { detail: [null, null] } })).toBe("kameron changed T7 detail");
     expect(text({ kind: "claim_expired", task: "T7", owner: "sub-a2" })).toBe("sub-a2's claim on T7 expired");
     expect(text({ kind: "roster", name: "kam", state: "renamed", was: "kameron" })).toBe("kameron is now known as kam");
     expect(text({ kind: "roster", name: "orch-b", state: "stale" })).toBe("orch-b is away");

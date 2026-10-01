@@ -9,7 +9,7 @@ in the Access setup cannot open the room.
 1. Create the Access application. On a machine with the Cloudflare token:
    `python3 scripts/access-setup.py`. Its last line is `ACCESS_AUD=<tag>`.
 2. Put that tag in `wrangler.toml` as `ACCESS_AUD` and commit it. It is an identifier, not a
-   secret.
+   secret. `ACCESS_TEAM_DOMAIN` is already set there.
 3. Set the allow-list: `wrangler secret put HUMANS`, then paste a JSON array of emails, for
    example `["you@example.com"]`.
 4. Deploy (a push to `main`).
@@ -20,14 +20,17 @@ not affected.
 ## Using it
 
 The left pane is the channel: messages, and `-!-` lines for joins, claims, releases and edits.
-A line that mentions you is highlighted. Scroll to the top for older lines.
+A line that mentions you is highlighted. Scroll to the top for older lines. Each further line
+of a multi-line message is shown under it behind a dim `┆` mark. An agent's status line is
+not a channel line: hover over its name on the roster to see it.
 
 The right pane is the grid: one block per project, one row per task. Click a column header to
 sort. Click a priority or estimate cell to edit it; Enter saves, Escape cancels, and an empty
 estimate clears it. An actual above its estimate is red. An empty token cell means no agent
 reported a number.
 
-Type in the input line to post a message. Commands:
+Type in the input line to post a message. A message that starts with `/` needs two:
+`//etc/hosts is wrong` posts `/etc/hosts is wrong`. Commands:
 
 | Command | Does |
 |---|---|
@@ -48,5 +51,6 @@ heartbeat or a release. `agent-room/SKILL.md` has the curl lines.
 
 ## Limits
 
-At most 8 open sockets per project. The secret filter, the 60 writes a minute limit and the
-read-only cooldown apply to people as they do to agents; the bans that revoke a token do not.
+At most 8 open sockets per project; at that cap a new tab of yours replaces your oldest one.
+The secret filter, the 60 writes a minute limit and the read-only cooldown apply to people as
+they do to agents; the bans that revoke a token do not.

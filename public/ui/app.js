@@ -476,37 +476,59 @@ function connect() {
 
 // ---------------------------------------------------------------- the input line
 
+/** Runs one typed line. True when the line was taken (the room accepted it, or it ran here). */
 async function submit(line) {
   const cmd = parseCommand(line);
-  if (cmd.kind === "none") return;
-  if (cmd.kind === "error") return sysLine(cmd.message, true);
-  if (cmd.kind === "local") {
-    if (cmd.name === "help") return sysLine(HELP);
-    if (!st.projects.includes(cmd.arg)) return sysLine(`no project named ${cmd.arg}`, true);
-    location.hash = cmd.arg;
-    return location.reload();
+  if (cmd.kind === "none") return true;
+  if (cmd.kind === "error") {
+    sysLine(cmd.message, true);
+    return false;
   }
+  if (cmd.kind === "local") {
+    if (cmd.name === "help") {
+      sysLine(HELP);
+      return true;
+    }
+    if (!st.projects.includes(cmd.arg)) {
+      sysLine(`no project named ${cmd.arg}`, true);
+      return false;
+    }
+    location.hash = cmd.arg;
+    location.reload();
+    return true;
+  }
+  let accepted = false;
   try {
     let action = cmd.action;
     let body = cmd.body;
     if (cmd.kind === "release") {
       const s = await api(h("sync", `?since=${FAR}`));
       const claim = s.status === 200 ? s.body.claims.find((c) => c.task === cmd.task_id && c.owner === myName()) : null;
-      if (!claim) return sysLine(`you hold no claim on ${cmd.task_id}`, true);
+      if (!claim) {
+        sysLine(`you hold no claim on ${cmd.task_id}`, true);
+        return false;
+      }
       action = "release";
       body = { claim_id: claim.claim_id, version: claim.version, state: cmd.state };
     }
     const r = await api(h(action), { ...body, key: newKey() });
-    if (r.status !== 200) return sysLine(describeError(r.status, r.body), true);
+    if (r.status !== 200) {
+      sysLine(describeError(r.status, r.body), true);
+      return false;
+    }
+    accepted = true;
     if (action === "nick") {
       st.me.name = r.body.name;
       renderStatus();
       renderRoster();
     }
     if (st.status !== "live") await catchUp(false);
-  } catch {
-    if (!st.signedOut) sysLine("the room did not answer; try again", true);
+  } catch (e) {
+    if (!accepted && !st.signedOut) sysLine("the room did not answer; try again", true);
+    // After an accepted line only the catch-up failed; it closed the socket, which reconnects.
+    if (accepted) console.warn("catch-up after a sent line failed", e);
   }
+  return accepted;
 }
 
 // ---------------------------------------------------------------- start
@@ -516,7 +538,12 @@ async function init() {
   const projects = await api("/h/projects");
   if (projects.status !== 200) return sysLine(describeError(projects.status, projects.body), true);
   st.projects = projects.body.projects;
-  const wanted = decodeURIComponent(location.hash.slice(1));
+  let wanted = "";
+  try {
+    wanted = decodeURIComponent(location.hash.slice(1));
+  } catch {
+    wanted = ""; // a malformed % in the hash: show the first project
+  }
   st.project = st.projects.includes(wanted) ? wanted : st.projects[0] ?? "";
   if (!st.project) return sysLine("no projects are configured", true);
   st.expanded.add(st.project);
@@ -545,8 +572,11 @@ $("inputform").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const input = $("input");
   const line = input.value;
-  input.value = "";
-  submit(line);
+  // The line stays in the input until the room takes it, so a refused line is not lost.
+  submit(line).then((taken) => {
+    if (taken && input.value === line) input.value = "";
+    else if (!taken && input.value === "") input.value = line;
+  });
 });
 
 $("chat").addEventListener("scroll", () => {

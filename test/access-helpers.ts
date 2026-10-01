@@ -76,7 +76,10 @@ export async function openSocket(
   const msgs: any[] = [];
   if (r.status !== 101 || !r.webSocket) return { status: r.status, msgs };
   const ws = r.webSocket;
-  ws.addEventListener("message", (e) => msgs.push(JSON.parse(String(e.data))));
+  // A block body: a listener that returns a value makes workerd warn on every message.
+  ws.addEventListener("message", (e) => {
+    msgs.push(JSON.parse(String(e.data)));
+  });
   ws.accept();
   return { status: 101, ws, msgs };
 }

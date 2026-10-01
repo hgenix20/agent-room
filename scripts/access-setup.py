@@ -19,7 +19,7 @@ HOST = "room.kamerongreen.dev"
 APP_NAME = "Agent Room UI"
 # /health and /p/* stay outside Access. The worker checks the Access header itself as well.
 PATHS = ["/ui", "/ui/*", "/h/*"]
-# The allow policy to reuse: the one on the application with this name.
+# The allow policy to reuse: the one named "me" on the application with this name.
 POLICY_FROM_APP = "Mind Window"
 ENV_FILE = "/etc/ai-company/cloudflare.env"
 
@@ -82,10 +82,11 @@ def main() -> None:
             sys.exit(f"access-setup: no Access application named {POLICY_FROM_APP!r} to copy the allow policy from")
         detail = call(token, "GET", f"/accounts/{account}/access/apps/{source['id']}")
         assert isinstance(detail, dict)
-        allows = [p for p in detail.get("policies", []) if p.get("decision") == "allow"]
-        allow = next((p for p in allows if p.get("name") == "me"), allows[0] if allows else None)
+        policies = detail.get("policies", [])
+        allow = next((p for p in policies if p.get("decision") == "allow" and p.get("name") == "me"), None)
         if allow is None:
-            sys.exit(f"access-setup: {POLICY_FROM_APP!r} has no allow policy")
+            found = ", ".join(f"{p.get('name')!r} ({p.get('decision')})" for p in policies) or "none"
+            sys.exit(f"access-setup: {POLICY_FROM_APP!r} has no allow policy named 'me'; policies found: {found}")
         print("reusing allow policy", allow["name"], allow["id"])
         app = call(token, "POST", f"/accounts/{account}/access/apps", {
             "name": APP_NAME,

@@ -96,8 +96,44 @@ describe("room socket", () => {
     expect((await human(`/h/${P}/ws`)).status).toBe(426);
     expect((await openSocket(P, { origin: "https://evil.test" })).status).toBe(403);
     expect((await openSocket(P, { headers: { "cf-access-jwt-assertion": "" } })).status).toBe(403);
-    for (let i = 0; i < 8; i++) expect((await openSocket("other")).status).toBe(101);
+    const mine = [];
+    for (let i = 0; i < 8; i++) {
+      const s = await openSocket("other");
+      expect(s.status).toBe(101);
+      mine.push(s);
+    }
+    // At the cap, the same person's ninth tab replaces their oldest.
+    const closed: { code: number; reason: string }[] = [];
+    mine[0].ws!.addEventListener("close", (e) => {
+      closed.push({ code: e.code, reason: e.reason });
+    });
+    expect((await openSocket("other")).status).toBe(101);
+    await until(() => closed.length > 0);
+    expect(closed[0]).toEqual({ code: 1000, reason: "replaced by a newer tab" });
+    await until(async () => (await socketCount("other")) === 8);
+    // When other people hold the cap, the socket is refused.
+    await closeSockets("other");
+    await until(async () => (await socketCount("other")) === 0);
+    for (let i = 0; i < 8; i++) expect((await openSocket("other", { email: "second@example.com" })).status).toBe(101);
     expect((await openSocket("other")).status).toBe(429);
+  });
+
+  it("a rename sends every task the person owns, with the new name", async () => {
+    const a = await joinOrch(P, uid("ws-j"));
+    const t = await newTask(a, uid("owned"));
+    const c = await human(`/h/${P}/claim`, { body: { task_id: t, scopes: [uid("ws-j")] } });
+    expect(c.status).toBe(200);
+    const was = (await human(`/h/${P}/me`)).body.name;
+    const s = await openSocket(P);
+    await until(() => s.msgs.length > 0);
+    const fresh = uid("kam");
+    try {
+      expect((await human(`/h/${P}/nick`, { body: { name: fresh } })).status).toBe(200);
+      await until(() => s.msgs.some((m) => m.type === "task" && m.task.id === t && m.task.owner === fresh));
+    } finally {
+      await human(`/h/${P}/nick`, { body: { name: was } });
+      await human(`/h/${P}/release`, { body: { claim_id: c.body.claim_id, version: c.body.version, state: "blocked" } });
+    }
   });
 
   it("takes the identity from the Access token, never from a header the browser sends", async () => {

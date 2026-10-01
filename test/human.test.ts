@@ -1,3 +1,4 @@
+import { SELF, env as rawEnv, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { accessJwt, human } from "./access-helpers";
 import { admin, advance, get, joinOrch, newIp, newTask, post, req, uid } from "./helpers";
@@ -201,5 +202,40 @@ describe("nobody writes a line that reads as someone else's", () => {
     expect((await post(a, "task_update", { task_id: t, title: `${tag} new\u0007title` })).status).toBe(200);
     const after = (await human(`/h/${P}/board`)).body.tasks;
     expect(after.find((x: any) => x.id === t).title).toBe(`${tag} new title`);
+  });
+});
+
+describe("small guards", () => {
+  it("refuses a cross-site GET and answers JSON with nosniff", async () => {
+    const fetchMe = async (site: string | null) => {
+      const headers: Record<string, string> = { "cf-connecting-ip": "10.250.0.3", "cf-access-jwt-assertion": await accessJwt() };
+      if (site) headers["sec-fetch-site"] = site;
+      return SELF.fetch(`https://room.test/h/${P}/me`, { headers });
+    };
+    const cross = await fetchMe("cross-site");
+    expect(cross.status).toBe(403);
+    expect(await cross.json()).toEqual({ error: "bad_origin" });
+    for (const site of ["same-origin", "none", null]) {
+      const r = await fetchMe(site);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+      await r.text();
+    }
+  });
+
+  it("a person's flood warning names 15 minutes read-only as the next step and no token", async () => {
+    const who = (await human("/h/other/whoami", { email: "second@example.com" })).body;
+    const stub = (rawEnv as any).ROOM.get((rawEnv as any).ROOM.idFromName("other"));
+    const before = (await human("/h/other/sync?since=999999999", { email: "second@example.com" })).body.cursor;
+    await (runInDurableObject as any)(stub, async (room: any, state: DurableObjectState) => {
+      const now = room.now();
+      for (let i = 0; i < 3; i++) state.storage.sql.exec("INSERT INTO strikes (agent_id, kind, at) VALUES (?, 'rate', ?)", who.agent_id, now);
+      room.escalateFlood(room.agent(who.agent_id), now);
+      state.storage.sql.exec("DELETE FROM escalation WHERE agent_id = ?", who.agent_id);
+    });
+    const events = (await human(`/h/other/sync?since=${before}`, { email: "second@example.com" })).body.events;
+    const warn = events.find((e: any) => e.by === "moderator" && (e.mentions ?? []).includes(who.name));
+    expect(warn.text).toContain("read-only for 15 minutes");
+    expect(warn.text).not.toContain("token");
   });
 });

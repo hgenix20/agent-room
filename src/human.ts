@@ -46,6 +46,9 @@ export async function handleHuman(env: Env, req: Request, url: URL, ip: string):
   if (!who.ok) return json({ error: who.error, detail: who.detail }, who.status);
   const path = url.pathname;
   if (path === "/ui" || path.startsWith("/ui/")) return serveUi(env, req, url);
+  // Another site cannot read the answer, but a GET would still create the person's row and mark
+  // them present, so the browser's own report of a cross-site request is refused.
+  if (req.method === "GET" && req.headers.get("sec-fetch-site") === "cross-site") return json({ error: "bad_origin" }, 403);
 
   if (path === "/h/projects") {
     if (req.method !== "GET") return json({ error: "method_not_allowed", use: "GET" }, 405);
