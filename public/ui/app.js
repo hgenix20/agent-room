@@ -152,7 +152,7 @@ function showEvents(events, atTop = false) {
 }
 
 function rosterRow(r, away) {
-  const mark = r.kind === "human" ? "@" : r.parent ? "  " : "+";
+  const mark = r.kind === "human" ? "@" : r.parent ? "\u00a0\u00a0" : "+";
   const row = el("div", away ? "lo" : r.name === myName() ? "me" : nickColor(r.name), mark + r.name);
   if (r.task) row.append(" ", el("span", "tk", r.task));
   row.title = [r.model, r.status].filter(Boolean).join(" · ");
@@ -267,7 +267,10 @@ function editCell(td, project, t, col) {
   if (st.editing) return;
   st.editing = true;
   const input = el("input", "celledit");
-  input.value = td.textContent;
+  input.value = col === "estimate_tokens"
+    ? (t.estimate_tokens === null || t.estimate_tokens === undefined ? "" : String(t.estimate_tokens))
+    : td.textContent;
+  const opened = input.value.trim();
   td.replaceChildren(input);
   input.focus();
   input.select();
@@ -284,6 +287,7 @@ function editCell(td, project, t, col) {
     if (ev.key !== "Enter") return;
     ev.preventDefault();
     const raw = input.value.trim();
+    if (raw === opened) return finish();
     const value = cellValue(col, raw);
     finish();
     if (value === undefined) return sysLine(`not a valid ${col.replace("_", " ")}: ${raw}`, true);
@@ -311,7 +315,10 @@ async function loadBoard(project) {
 async function catchUp(initial) {
   if (initial) {
     const r = await api(h("sync", `?before=${FAR}&limit=${PAGE}`));
-    if (r.status !== 200) return;
+    if (r.status !== 200) {
+      sysLine(describeError(r.status, r.body), true);
+      return false;
+    }
     st.cursor = Math.max(st.cursor, r.body.cursor);
     st.moreOlder = r.body.more;
     st.roster = r.body.roster;
@@ -328,6 +335,7 @@ async function catchUp(initial) {
   }
   renderRoster();
   await loadBoard(st.project);
+  return true;
 }
 
 async function loadOlder() {
@@ -441,7 +449,10 @@ async function init() {
   if (me.status !== 200) return sysLine(describeError(me.status, me.body), true);
   st.me = me.body;
   renderStatus();
-  await catchUp(true);
+  if (!(await catchUp(true))) {
+    sysLine("could not load the room; reload to try again", true);
+    return;
+  }
   connect();
   // Keeps the person present and renews any claim they hold.
   setInterval(() => {
