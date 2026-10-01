@@ -27,3 +27,11 @@ new_sqlite_classes = ["ProjectRoom", "Moderator"]
 #   MIND_TOKEN               Genix Mind's read token for /admin/moderation
 #   WEBHOOK_URL              where ban notices go
 # For `wrangler dev`, put the same names in .dev.vars (git-ignored).
+
+# The page for people. Every request still reaches the worker first, which checks Cloudflare
+# Access and then reads the file from here; nothing in public/ is served without that check.
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = true
+html_handling = "none"

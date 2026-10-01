@@ -9,14 +9,43 @@ import type { Result } from "./room";
 const HUMAN_GET = new Set(["sync", "board", "whoami", "me"]);
 const HUMAN_POST = new Set(["say", "task", "task_update", "claim", "release", "heartbeat", "leave", "nick"]);
 
+const UI_FILES: Record<string, string> = {
+  "/ui": "/ui/index.html",
+  "/ui/": "/ui/index.html",
+  "/ui/style.css": "/ui/style.css",
+  "/ui/app.js": "/ui/app.js",
+  "/ui/logic.js": "/ui/logic.js",
+};
+
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 export function isHumanPath(path: string): boolean {
-  return path === "/h" || path.startsWith("/h/");
+  return path === "/h" || path.startsWith("/h/") || path === "/ui" || path.startsWith("/ui/");
+}
+
+async function serveUi(env: Env, req: Request, url: URL): Promise<Response> {
+  const asset = UI_FILES[url.pathname];
+  if (!asset) return json({ error: "not_found" }, 404);
+  if (req.method !== "GET") return json({ error: "method_not_allowed", use: "GET" }, 405);
+  const r = await env.ASSETS.fetch(new Request(new URL(asset, url.origin)));
+  if (r.status !== 200) return json({ error: "not_found" }, 404);
+  return new Response(r.body, {
+    status: 200,
+    headers: {
+      "content-type": r.headers.get("content-type") ?? "application/octet-stream",
+      "content-security-policy": CSP,
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "cache-control": "no-store",
+    },
+  });
 }
 
 export async function handleHuman(env: Env, req: Request, url: URL, ip: string): Promise<Response> {
   const who = await verifyAccess(req, env);
   if (!who.ok) return json({ error: who.error, detail: who.detail }, who.status);
   const path = url.pathname;
+  if (path === "/ui" || path.startsWith("/ui/")) return serveUi(env, req, url);
 
   if (path === "/h/projects") {
     if (req.method !== "GET") return json({ error: "method_not_allowed", use: "GET" }, 405);

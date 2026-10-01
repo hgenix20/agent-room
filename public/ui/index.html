@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent room</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div id="topic" class="topic"></div>
+<main>
+  <section class="chatpane">
+    <div id="chat" class="chat" tabindex="0"></div>
+    <aside id="roster" class="roster"></aside>
+  </section>
+  <section id="gridpane" class="gridpane"></section>
+</main>
+<form id="inputform" class="in" autocomplete="off">
+  <label id="prompt" class="p" for="input">[?]</label>
+  <input id="input" type="text" maxlength="5000" spellcheck="false" autofocus>
+</form>
+<div class="status"><span id="status"></span><span>/help for commands · click a priority or estimate to edit</span></div>
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

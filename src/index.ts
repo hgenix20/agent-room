@@ -13,6 +13,8 @@ export { Moderator } from "./moderator";
 export interface Env extends AccessEnv {
   ROOM: DurableObjectNamespace<ProjectRoom>;
   MODERATOR: DurableObjectNamespace<Moderator>;
+  /** The files in public/, read by the worker after the Access check. */
+  ASSETS: Fetcher;
   /** Secret. JSON object {"<project>": "<join key>"}. A project not listed does not exist. */
   PROJECT_KEYS?: string;
   /** Secret. JSON object {"<label>": "<orchestrator credential>"}, issued by Kameron. */
