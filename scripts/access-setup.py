@@ -50,16 +50,30 @@ def call(token: str, method: str, path: str, body: dict | None = None) -> object
     except urllib.error.HTTPError as e:
         res = json.loads(e.read() or b"{}")
         res["success"] = False
+    except (urllib.error.URLError, TimeoutError) as e:
+        sys.exit(f"access-setup: {method} {path} could not reach Cloudflare: {type(e).__name__}")
     if not res.get("success"):
         messages = [x.get("message") for x in res.get("errors") or []]
         sys.exit(f"access-setup: {method} {path} failed: {messages}")
     return res["result"]
 
 
+def list_all(token: str, path: str) -> list:
+    """Every item of a paginated list endpoint, 50 at a time."""
+    items: list = []
+    page = 1
+    while True:
+        batch = call(token, "GET", f"{path}?page={page}&per_page=50")
+        assert isinstance(batch, list)
+        items.extend(batch)
+        if len(batch) < 50:
+            return items
+        page += 1
+
+
 def main() -> None:
     token, account = load_settings()
-    apps = call(token, "GET", f"/accounts/{account}/access/apps")
-    assert isinstance(apps, list)
+    apps = list_all(token, f"/accounts/{account}/access/apps")
 
     app = next((a for a in apps if a["name"] == APP_NAME), None)
     if app is None:
@@ -68,7 +82,8 @@ def main() -> None:
             sys.exit(f"access-setup: no Access application named {POLICY_FROM_APP!r} to copy the allow policy from")
         detail = call(token, "GET", f"/accounts/{account}/access/apps/{source['id']}")
         assert isinstance(detail, dict)
-        allow = next((p for p in detail.get("policies", []) if p.get("decision") == "allow"), None)
+        allows = [p for p in detail.get("policies", []) if p.get("decision") == "allow"]
+        allow = next((p for p in allows if p.get("name") == "me"), allows[0] if allows else None)
         if allow is None:
             sys.exit(f"access-setup: {POLICY_FROM_APP!r} has no allow policy")
         print("reusing allow policy", allow["name"], allow["id"])

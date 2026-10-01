@@ -3,3 +3,4 @@ node_modules/
 .dev.vars
 .agent-room/
 .superpowers/
+__pycache__/
