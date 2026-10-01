@@ -48,6 +48,15 @@ export interface CallInput {
   ip: string;
 }
 
+export interface HumanInput {
+  project: string;
+  email: string; // verified by the worker from the Access header, lowercased
+  action: string;
+  body: Record<string, unknown>;
+  query: Record<string, string>;
+  ip: string;
+}
+
 export interface RevokeInfo {
   found: boolean;
   agent_id: string;
@@ -73,6 +82,8 @@ interface AgentRow {
   state: string; // active | left | revoked | banned
   roster_state: string; // active | stale | gone
   orphaned: number; // 1 while its parent's token is revoked and nobody has adopted it
+  kind: string; // agent | human
+  email: string | null;
   [k: string]: SqlStorageValue;
 }
 
@@ -110,7 +121,13 @@ interface TaskRow {
   [k: string]: SqlStorageValue;
 }
 
-const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "task_update", "claim", "release", "leave", "adopt"]);
+const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "task_update", "claim", "release", "leave", "adopt", "nick"]);
+
+/** Stored in token_hash for a person. A real hash is 64 hex characters, so no token matches it. */
+const HUMAN_TOKEN_HASH = "human";
+
+const EVENT_SELECT = `SELECT e.seq, e.kind, e.agent_id, e.task_id, e.data, e.created_at, m.text, m.reply_to, m.mentions
+       FROM events e LEFT JOIN messages m ON m.seq = e.seq`;
 
 export class ProjectRoom extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -177,6 +194,8 @@ export class ProjectRoom extends DurableObject<Env> {
   /** Brings a room made by an older version up to this one. Safe to run again. */
   private migrate(): void {
     this.addColumn("agents", "orphaned", "orphaned INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("agents", "kind", "kind TEXT NOT NULL DEFAULT 'agent'");
+    this.addColumn("agents", "email", "email TEXT");
     this.addColumn("tasks", "priority", "priority TEXT NOT NULL DEFAULT 'normal'");
     this.addColumn("tasks", "estimate_minutes", "estimate_minutes INTEGER");
     this.addColumn("tasks", "estimate_tokens", "estimate_tokens INTEGER");
@@ -254,6 +273,7 @@ export class ProjectRoom extends DurableObject<Env> {
   /** An agent is alive while it or a descendant was seen in the last 30 minutes, or it holds a live claim. */
   private alive(a: AgentRow, now: number): boolean {
     if (a.state !== "active") return false;
+    if (a.kind === "human") return true; // a person's credential is the Access session, checked by the worker
     if (a.tree_seen > now - LIMITS.goneMs) return true;
     return this.liveClaimsOf(a.id).length > 0;
   }
@@ -302,7 +322,9 @@ export class ProjectRoom extends DurableObject<Env> {
     }
     for (const a of this.rows<AgentRow>("SELECT * FROM agents WHERE state = 'active'")) {
       const quiet = now - a.last_seen;
-      const next = quiet >= LIMITS.goneMs ? "gone" : quiet >= LIMITS.staleMs ? "stale" : "active";
+      // A person is away after 10 quiet minutes and never gone.
+      const next =
+        a.kind === "human" ? (quiet >= LIMITS.staleMs ? "stale" : "active") : quiet >= LIMITS.goneMs ? "gone" : quiet >= LIMITS.staleMs ? "stale" : "active";
       if (next !== a.roster_state && next !== "active") {
         this.sql.exec("UPDATE agents SET roster_state = ? WHERE id = ?", next, a.id);
         this.event("roster", a.id, a.id, a.task_id, { name: a.name, state: next });
@@ -374,9 +396,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!NAME_RE.test(input.name)) return { status: 400, body: { error: "bad_name", detail: "letters, digits, . _ - up to 40" } };
       const model = String(input.model || "unknown").slice(0, 80);
       let name = input.name;
-      const taken = (n: string) =>
-        this.rows<AgentRow>("SELECT * FROM agents WHERE name = ? AND state = 'active'", n).some((a) => this.alive(a, now));
-      for (let i = 2; taken(name); i++) name = `${input.name}-${i}`;
+      for (let i = 2; this.nameTaken(name, now); i++) name = `${input.name}-${i}`;
       this.sql.exec(
         `INSERT INTO agents (id, name, model, parent_id, token_hash, last_seen, tree_seen, joined_at, cred_label, ip)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -413,46 +433,98 @@ export class ProjectRoom extends DurableObject<Env> {
       const now = this.now();
       this.sweep(now);
       const me = this.agent(input.agentId);
-      if (!me || me.token_hash !== input.tokenHash) return { status: 401, body: { error: "bad_token" }, badToken: true };
+      if (!me || me.kind === "human" || me.token_hash !== input.tokenHash) return { status: 401, body: { error: "bad_token" }, badToken: true };
       const problem = this.chainProblem(me, now);
       if (problem) return { status: 401, body: { error: "token_not_valid", detail: problem }, badToken: true };
-
-      const write = WRITE_ACTIONS.has(input.action);
-      const key = write && typeof input.body.key === "string" ? input.body.key.slice(0, 128) : null;
-      const scope = `${me.id}:${input.action}`;
-      const replay = this.idemGet(scope, key);
-      if (replay) {
-        this.touch(me, now);
-        return replay;
-      }
-
-      if (write) {
-        const ro = this.first<{ read_only_until: number }>("SELECT read_only_until FROM escalation WHERE agent_id = ?", me.id);
-        if (ro && ro.read_only_until > now) {
-          return {
-            status: 403,
-            body: { error: "read_only", detail: "read-only: writes refused, reads and sync still work", read_only_until: ro.read_only_until, retry_after_s: Math.ceil((ro.read_only_until - now) / 1000) },
-          };
-        }
-        const limited = this.rateCheck(me, input.action === "heartbeat" ? "h" : "w", now);
-        if (limited) return limited;
-      }
-
-      let r: Result;
-      try {
-        r = this.dispatch(input.action, me, input.body, input.query, now);
-      } catch (e) {
-        if (e instanceof SecretRefused) {
-          r = this.secretStrike(me, e.reason, now);
-          if (r.violation) return r;
-        } else if (e instanceof HttpError) {
-          r = { status: e.status, body: e.body };
-        } else throw e;
-      }
-      if (this.agent(me.id)?.state === "active") this.touch(me, now);
-      this.idemPut(scope, key, r);
-      return r;
+      return this.runAction(me, input.action, input.body, input.query, now);
     });
+  }
+
+  /** A call from a signed-in person. The worker has already verified the email. */
+  async humanCall(input: HumanInput): Promise<Result> {
+    this.project = input.project;
+    return this.ctx.storage.transactionSync((): Result => {
+      const now = this.now();
+      this.sweep(now);
+      const me = this.ensureHuman(input.email, input.ip, now);
+      return this.runAction(me, input.action, input.body, input.query, now);
+    });
+  }
+
+  /** Idempotency, the read-only and rate checks, the action itself, and the bookkeeping after it. */
+  private runAction(me: AgentRow, action: string, body: Record<string, unknown>, query: Record<string, string>, now: number): Result {
+    const write = WRITE_ACTIONS.has(action);
+    const key = write && typeof body.key === "string" ? body.key.slice(0, 128) : null;
+    const scope = `${me.id}:${action}`;
+    const replay = this.idemGet(scope, key);
+    if (replay) {
+      this.touch(me, now);
+      return replay;
+    }
+
+    if (write) {
+      const ro = this.first<{ read_only_until: number }>("SELECT read_only_until FROM escalation WHERE agent_id = ?", me.id);
+      if (ro && ro.read_only_until > now) {
+        return {
+          status: 403,
+          body: { error: "read_only", detail: "read-only: writes refused, reads and sync still work", read_only_until: ro.read_only_until, retry_after_s: Math.ceil((ro.read_only_until - now) / 1000) },
+        };
+      }
+      const limited = this.rateCheck(me, action === "heartbeat" ? "h" : "w", now);
+      if (limited) return limited;
+    }
+
+    let r: Result;
+    try {
+      r = this.dispatch(action, me, body, query, now);
+    } catch (e) {
+      if (e instanceof SecretRefused) {
+        r = this.secretStrike(me, e.reason, now);
+        if (r.violation) return r;
+      } else if (e instanceof HttpError) {
+        r = { status: e.status, body: e.body };
+      } else throw e;
+    }
+    // After a leave the caller is away on purpose; touching would mark them present again.
+    if (action !== "leave" && this.agent(me.id)?.state === "active") this.touch(me, now);
+    this.idemPut(scope, key, r);
+    return r;
+  }
+
+  private nameTaken(name: string, now: number): boolean {
+    return this.rows<AgentRow>("SELECT * FROM agents WHERE name = ? AND state = 'active'", name).some((a) => this.alive(a, now));
+  }
+
+  /** The person's row for this email, made on their first call. One row per email per room. */
+  private ensureHuman(email: string, ip: string, now: number): AgentRow {
+    const found = this.first<AgentRow>("SELECT * FROM agents WHERE kind = 'human' AND email = ?", email);
+    if (found) {
+      if (found.state === "active") return found;
+      this.sql.exec("UPDATE agents SET state = 'active', roster_state = 'stale' WHERE id = ?", found.id);
+      return this.agent(found.id)!;
+    }
+    const local = email.split("@")[0].replace(/[^A-Za-z0-9._-]/g, "").replace(/^[^A-Za-z0-9]+/, "");
+    const base = local.slice(0, LIMITS.nameChars - 4) || "human";
+    let name = base;
+    for (let i = 2; name === "moderator" || this.nameTaken(name, now); i++) name = `${base}-${i}`;
+    const id = newAgentId();
+    this.sql.exec(
+      `INSERT INTO agents (id, name, model, parent_id, token_hash, last_seen, tree_seen, joined_at, cred_label, ip, kind, email)
+       VALUES (?, ?, 'human', NULL, ?, ?, ?, ?, NULL, ?, 'human', ?)`,
+      id, name, HUMAN_TOKEN_HASH, now, now, now, ip, email,
+    );
+    this.event("join", id, id, null, { name, model: "human", parent: null });
+    return this.agent(id)!;
+  }
+
+  private nick(me: AgentRow, body: Record<string, unknown>, now: number): Result {
+    const name = str(body.name, "name", LIMITS.nameChars, true);
+    if (!NAME_RE.test(name)) throw new HttpError(400, { error: "bad_name", detail: "letters, digits, . _ - up to 40" });
+    if (name === me.name) return { status: 200, body: { name } };
+    if (name === "moderator" || this.nameTaken(name, now)) throw new HttpError(409, { error: "name_taken", name });
+    this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", name, me.id);
+    this.event("roster", me.id, me.id, null, { name, state: "renamed", was: me.name });
+    return { status: 200, body: { name } };
   }
 
   private rateCheck(me: AgentRow, kind: "h" | "w", now: number): Result | null {
@@ -486,7 +558,8 @@ export class ProjectRoom extends DurableObject<Env> {
     if (n < LIMITS.floodStrikes) return null;
     this.sql.exec("DELETE FROM strikes WHERE agent_id = ? AND kind = 'rate'", me.id);
     const cur = this.first<{ step: number }>("SELECT step FROM escalation WHERE agent_id = ?", me.id)?.step ?? 0;
-    const step = cur + 1;
+    // A person is never revoked: after the warning, each further step is another read-only spell.
+    const step = me.kind === "human" ? Math.min(cur + 1, 2) : cur + 1;
     if (step === 1) {
       this.sql.exec(
         "INSERT INTO escalation (agent_id, step, warned_at) VALUES (?, 1, ?) ON CONFLICT(agent_id) DO UPDATE SET step = 1, warned_at = excluded.warned_at",
@@ -546,6 +619,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private maybeBan(me: AgentRow, kind: string, now: number, detail: string): Result | null {
+    if (me.kind === "human") return null; // the refusal stands; a person is not banned by a rule
     const n = this.first<{ n: number }>(
       "SELECT COUNT(*) AS n FROM strikes WHERE agent_id = ? AND kind = ? AND at > ?",
       me.id, kind, now - 3600_000,
@@ -591,6 +665,12 @@ export class ProjectRoom extends DurableObject<Env> {
         return this.leave(me, now);
       case "whoami":
         return { status: 200, body: { agent_id: me.id, name: me.name, model: me.model, parent: this.nameOf(me.parent_id), task: this.currentTask(me.id) } };
+      case "me":
+        if (me.kind !== "human") throw new HttpError(404, { error: "unknown_call", call: action });
+        return { status: 200, body: { name: me.name, email: me.email, kind: "human" } };
+      case "nick":
+        if (me.kind !== "human") throw new HttpError(404, { error: "unknown_call", call: action });
+        return this.nick(me, body, now);
       default:
         throw new HttpError(404, { error: "unknown_call", call: action });
     }
@@ -737,7 +817,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const t = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId);
     if (!t) throw new HttpError(404, { error: "unknown_task", task: taskId });
     const mine = t.created_by === me.id || this.liveClaimsOf(me.id).some((c) => c.task_id === taskId);
-    if (!mine) throw new HttpError(403, { error: "not_yours", detail: "you can update a task you created or hold a claim on" });
+    if (me.kind !== "human" && !mine) throw new HttpError(403, { error: "not_yours", detail: "you can update a task you created or hold a claim on" });
 
     const next: Record<string, string | number | null> = {};
     if (body.title !== undefined) next.title = str(body.title, "title", LIMITS.titleChars, true);
@@ -901,6 +981,12 @@ ${next.detail ?? ""}`);
 
   private leave(me: AgentRow, now: number): Result {
     const r = this.release(me, { all: true, state: "blocked" }, now);
+    if (me.kind === "human") {
+      // A person steps away; the row stays, and their next call marks them present again.
+      this.sql.exec("UPDATE agents SET roster_state = 'stale', task_id = NULL WHERE id = ?", me.id);
+      this.event("roster", me.id, me.id, null, { name: me.name, state: "stale" });
+      return { status: 200, body: { ok: true, released: r.body.released } };
+    }
     this.sql.exec("UPDATE agents SET state = 'left', task_id = NULL WHERE id = ?", me.id);
     this.event("roster", me.id, me.id, null, { name: me.name, state: "left" });
     return { status: 200, body: { ok: true, released: r.body.released } };
@@ -950,13 +1036,43 @@ ${next.detail ?? ""}`);
     return { status: 200, body: { tasks } };
   }
 
+  /** One event in the shape callers read: the stored data, plus the text of a message. */
+  private viewEvent(r: Record<string, SqlStorageValue>): Record<string, unknown> {
+    const e: Record<string, unknown> = { seq: r.seq, kind: r.kind, at: r.created_at, ...JSON.parse(r.data as string) };
+    if (r.kind === "say") {
+      e.text = r.text;
+      if (r.reply_to !== null) e.reply_to = r.reply_to;
+      const ms = ((r.mentions as string | null) ?? "").split(",").filter(Boolean);
+      if (ms.length) e.mentions = ms;
+    }
+    return e;
+  }
+
+  private rosterView(now: number): Record<string, unknown>[] {
+    return this.rows<AgentRow>("SELECT * FROM agents WHERE state = 'active' ORDER BY joined_at")
+      .filter((a) => a.roster_state !== "gone" || this.liveClaimsOf(a.id).length > 0)
+      .map((a) => ({
+        name: a.name,
+        model: a.model,
+        parent: this.nameOf(a.parent_id),
+        task: this.currentTask(a.id),
+        status: a.status_line || undefined,
+        state: a.roster_state,
+        orphaned: a.orphaned ? true : undefined,
+        kind: a.kind === "human" ? "human" : undefined,
+        idle_min: Math.floor((now - a.last_seen) / 60_000),
+      }));
+  }
+
   private sync(me: AgentRow, query: Record<string, string>, now: number): Result {
     const since = Math.max(0, Math.floor(Number(query.since ?? 0)) || 0);
+    // before=<seq> pages backwards: the newest `limit` events below that seq, oldest first.
+    const before = query.before === undefined ? null : Math.max(0, Math.floor(Number(query.before)) || 0);
     const limit = Math.min(LIMITS.syncMax, Math.max(1, Math.floor(Number(query.limit ?? LIMITS.syncDefault)) || LIMITS.syncDefault));
     const mentionsOnly = query.only === "mentions";
     const task = query.task ? String(query.task).slice(0, 40) : null;
-    const conds: string[] = ["e.seq > ?"];
-    const args: SqlStorageValue[] = [since];
+    const conds: string[] = [before === null ? "e.seq > ?" : "e.seq < ?"];
+    const args: SqlStorageValue[] = [before === null ? since : before];
     const mentionCond = "(e.kind = 'say' AND (m.mentions LIKE ? OR m.reply_to IN (SELECT seq FROM messages WHERE agent_id = ?)))";
     const mentionArgs = [`%,${me.name},%`, me.id];
     if (mentionsOnly && task) {
@@ -970,37 +1086,15 @@ ${next.detail ?? ""}`);
       args.push(task);
     }
     const rows = this.rows<Record<string, SqlStorageValue>>(
-      `SELECT e.seq, e.kind, e.agent_id, e.task_id, e.data, e.created_at, m.text, m.reply_to, m.mentions
-       FROM events e LEFT JOIN messages m ON m.seq = e.seq
-       WHERE ${conds.join(" AND ")} ORDER BY e.seq LIMIT ?`,
+      `${EVENT_SELECT} WHERE ${conds.join(" AND ")} ORDER BY e.seq ${before === null ? "ASC" : "DESC"} LIMIT ?`,
       ...args, limit + 1,
     );
     const more = rows.length > limit;
     const page = rows.slice(0, limit);
-    const cursor = more ? (page[page.length - 1].seq as number) : this.head();
-    const events = page.map((r) => {
-      const data = JSON.parse(r.data as string);
-      const e: Record<string, unknown> = { seq: r.seq, kind: r.kind, at: r.created_at, ...data };
-      if (r.kind === "say") {
-        e.text = r.text;
-        if (r.reply_to !== null) e.reply_to = r.reply_to;
-        const ms = (r.mentions as string).split(",").filter(Boolean);
-        if (ms.length) e.mentions = ms;
-      }
-      return e;
-    });
-    const roster = this.rows<AgentRow>("SELECT * FROM agents WHERE state = 'active' ORDER BY joined_at")
-      .filter((a) => a.roster_state !== "gone" || this.liveClaimsOf(a.id).length > 0)
-      .map((a) => ({
-        name: a.name,
-        model: a.model,
-        parent: this.nameOf(a.parent_id),
-        task: this.currentTask(a.id),
-        status: a.status_line || undefined,
-        state: a.roster_state,
-        orphaned: a.orphaned ? true : undefined,
-        idle_min: Math.floor((now - a.last_seen) / 60_000),
-      }));
+    if (before !== null) page.reverse();
+    const cursor = before === null && more ? (page[page.length - 1].seq as number) : this.head();
+    const events = page.map((r) => this.viewEvent(r));
+    const roster = this.rosterView(now);
     const claims = this.rows<ClaimRow>("SELECT * FROM claims WHERE state = 'live' ORDER BY created_at").map((c) => ({
       claim_id: c.id,
       task: c.task_id,
@@ -1046,7 +1140,8 @@ ${next.detail ?? ""}`);
   async revoke(agentId: string, opts: { ban: boolean; rule: number; tokenHash?: string }): Promise<RevokeInfo> {
     return this.ctx.storage.transactionSync(() => {
       const a = this.agent(agentId);
-      if (!a || (opts.tokenHash && a.token_hash !== opts.tokenHash)) {
+      // A person's access is the HUMANS list, so a token revoke has nothing to revoke.
+      if (!a || a.kind === "human" || (opts.tokenHash && a.token_hash !== opts.tokenHash)) {
         return { found: false, agent_id: agentId, agent_name: null, parent_name: null, token_prefix: null, descendants: [], orphans: [] };
       }
       return this.revokeTree(agentId, opts.ban, opts.rule, this.now());

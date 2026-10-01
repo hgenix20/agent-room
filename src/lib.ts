@@ -192,3 +192,31 @@ export const RULES: Record<number, string> = {
   6: "join naming a parent token that is not live or not in the joiner's chain (refused; the parent is told)",
   5: "flooding (over 60 writes a minute, 3 times in an hour: warning, 15 minutes read-only, then revoked), or 3 messages refused by the secret filter",
 };
+
+export const MAX_BODY = 64 * 1024;
+
+/** A JSON object of strings from a secret or var; anything else reads as empty. */
+export function jsonMap(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The request's JSON object body; {} for a GET or an empty body. Throws HttpError 413 or 400. */
+export async function readBody(req: Request): Promise<Record<string, unknown>> {
+  if (req.method === "GET") return {};
+  const text = await req.text();
+  if (text.length > MAX_BODY) throw new HttpError(413, { error: "body_too_large" });
+  if (!text.trim()) return {};
+  try {
+    const v = JSON.parse(text);
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error();
+    return v;
+  } catch {
+    throw new HttpError(400, { error: "bad_json" });
+  }
+}

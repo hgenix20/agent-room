@@ -1,4 +1,5 @@
-import { env as rawEnv } from "cloudflare:test";
+import { SELF, env as rawEnv } from "cloudflare:test";
+import type { Res } from "./helpers";
 
 const enc = new TextEncoder();
 const RSA = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
@@ -30,4 +31,27 @@ let configKey: Promise<CryptoKey> | null = null;
 export async function accessJwt(email = "kameron@example.com", over: Record<string, unknown> = {}): Promise<string> {
   configKey ??= crypto.subtle.importKey("jwk", JSON.parse((rawEnv as any).TEST_ACCESS_PRIVATE_JWK), RSA, false, ["sign"]);
   return signJwt(await configKey, "test-kid", claimsFor(email, over));
+}
+
+/**
+ * A call as a signed-in person. A POST carries the worker's own Origin unless `origin` says
+ * otherwise (null sends none). `jwt: null` sends no Access header.
+ */
+export async function human(
+  path: string,
+  opts: { email?: string; body?: unknown; method?: string; origin?: string | null; jwt?: string | null } = {},
+): Promise<Res> {
+  const method = opts.method ?? (opts.body === undefined ? "GET" : "POST");
+  const headers: Record<string, string> = { "cf-connecting-ip": "10.250.0.1" };
+  const jwt = opts.jwt === undefined ? await accessJwt(opts.email) : opts.jwt;
+  if (jwt) headers["cf-access-jwt-assertion"] = jwt;
+  const origin = opts.origin === undefined ? (method === "GET" ? null : "https://room.test") : opts.origin;
+  if (origin) headers.origin = origin;
+  if (opts.body !== undefined) headers["content-type"] = "application/json";
+  const r = await SELF.fetch(`https://room.test${path}`, {
+    method,
+    headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
+  return { status: r.status, body: await r.json() };
 }

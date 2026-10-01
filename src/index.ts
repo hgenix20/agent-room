@@ -1,7 +1,8 @@
 // Agent Room worker: checks each call, runs the moderator's fixed rules, and
 // passes the call to the project's Durable Object.
 
-import { HttpError, PROJECT_RE, json, makeToken, newAgentId, parseToken, safeEqual, sha256 } from "./lib";
+import { HttpError, PROJECT_RE, json, jsonMap, makeToken, newAgentId, parseToken, readBody, safeEqual, sha256 } from "./lib";
+import { handleHuman, isHumanPath } from "./human";
 import type { ProjectRoom, Result } from "./room";
 import type { BanInput, Moderator } from "./moderator";
 import type { AccessEnv } from "./access";
@@ -30,7 +31,6 @@ export interface Env extends AccessEnv {
 
 const ROOM_CALLS = new Set(["heartbeat", "sync", "say", "board", "task", "task_update", "claim", "release", "leave", "whoami", "adopt"]);
 const GET_CALLS = new Set(["sync", "board", "whoami"]);
-const MAX_BODY = 64 * 1024;
 
 let blockCache: { at: number; ips: Map<string, number> } | null = null;
 
@@ -40,16 +40,6 @@ function moderator(env: Env) {
 
 function room(env: Env, project: string) {
   return env.ROOM.get(env.ROOM.idFromName(project));
-}
-
-function jsonMap(raw: string | undefined): Record<string, string> {
-  if (!raw) return {};
-  try {
-    const v = JSON.parse(raw);
-    return v && typeof v === "object" ? v : {};
-  } catch {
-    return {};
-  }
 }
 
 function sourceOf(req: Request): string {
@@ -70,20 +60,6 @@ async function isBlocked(env: Env, ip: string): Promise<boolean> {
 
 function noteBlock(ip: string, until: number) {
   blockCache?.ips.set(ip, until);
-}
-
-async function readBody(req: Request): Promise<Record<string, unknown>> {
-  if (req.method === "GET") return {};
-  const text = await req.text();
-  if (text.length > MAX_BODY) throw new HttpError(413, { error: "body_too_large" });
-  if (!text.trim()) return {};
-  try {
-    const v = JSON.parse(text);
-    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error();
-    return v;
-  } catch {
-    throw new HttpError(400, { error: "bad_json" });
-  }
 }
 
 async function ban(env: Env, input: BanInput): Promise<Response> {
@@ -262,6 +238,7 @@ export default {
     const path = url.pathname;
     const ip = sourceOf(req);
     try {
+      if (isHumanPath(path)) return await handleHuman(env, req, url, ip);
       const admin = path.match(/^\/admin\/([a-z]+)$/);
       if (admin) return await handleAdmin(env, req, admin[1], url);
 
