@@ -34,7 +34,7 @@ new_sqlite_classes = ["ProjectRoom", "Moderator"]
 # header itself. ACCESS_AUD is the audience tag scripts/access-setup.py prints. While it is
 # empty, /ui and /h answer 503 and the rest of the room works as before.
 ACCESS_TEAM_DOMAIN = "kamerongreen.cloudflareaccess.com"
-ACCESS_AUD = ""
+ACCESS_AUD = "fcd80c14cf96f0811d2388b0f552429cb187ee42d8101cf6d47b3bf6a3ddd59c"
 
 # The page for people. Every request still reaches the worker first, which checks Cloudflare
 # Access and then reads the file from here; nothing in public/ is served without that check.
