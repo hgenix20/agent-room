@@ -6,6 +6,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   HttpError,
   LIMITS,
+  json,
   NAME_RE,
   newAgentId,
   parseMentions,
@@ -129,10 +130,17 @@ const HUMAN_TOKEN_HASH = "human";
 const EVENT_SELECT = `SELECT e.seq, e.kind, e.agent_id, e.task_id, e.data, e.created_at, m.text, m.reply_to, m.mentions
        FROM events e LEFT JOIN messages m ON m.seq = e.seq`;
 
+/** Event kinds that change what the roster shows. */
+const ROSTER_KINDS = new Set(["join", "roster", "status", "claim", "release", "claim_expired"]);
+/** Event kinds that change a task row. */
+const TASK_KINDS = new Set(["task", "task_updated", "claim", "release", "claim_expired"]);
+
 export class ProjectRoom extends DurableObject<Env> {
   private sql: SqlStorage;
   private offset = 0;
   private project = "";
+  /** Tasks changed in the current call without an event of their own (a token report). */
+  private dirtyTasks = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -181,6 +189,8 @@ export class ProjectRoom extends DurableObject<Env> {
         PRIMARY KEY (task_id, agent_id));
     `);
     this.migrate();
+    // A sleeping room answers "ping" with "pong" without waking.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
     if (off) this.offset = Number(off.v);
   }
@@ -213,6 +223,94 @@ export class ProjectRoom extends DurableObject<Env> {
          WHERE state = 'done' AND ended_at IS NULL`,
       );
       this.sql.exec("INSERT INTO meta (k, v) VALUES ('task_times_backfilled', '1') ON CONFLICT(k) DO NOTHING");
+    }
+  }
+
+  /** Sockets that can still take a message. getWebSockets() may list one that is closing. */
+  private openSockets(tag?: string): WebSocket[] {
+    return this.ctx.getWebSockets(tag).filter((ws) => ws.readyState === 1);
+  }
+
+  /** Runs `fn` in one transaction, then tells the open sockets what it committed. */
+  private commit<T>(fn: () => T): T {
+    const before = this.head();
+    this.dirtyTasks.clear();
+    const out = this.ctx.storage.transactionSync(fn);
+    this.broadcast(before);
+    return out;
+  }
+
+  /** New events in seq order, then each changed task, then the roster when it changed. */
+  private broadcast(before: number): void {
+    const dirty = new Set(this.dirtyTasks);
+    this.dirtyTasks.clear();
+    const socks = this.openSockets();
+    if (!socks.length) return;
+    const now = this.now();
+    const out: string[] = [];
+    let roster = false;
+    for (const r of this.rows<Record<string, SqlStorageValue>>(`${EVENT_SELECT} WHERE e.seq > ? ORDER BY e.seq`, before)) {
+      out.push(JSON.stringify({ type: "event", event: this.viewEvent(r) }));
+      if (ROSTER_KINDS.has(r.kind as string)) roster = true;
+      if (r.task_id && TASK_KINDS.has(r.kind as string)) dirty.add(r.task_id as string);
+    }
+    for (const id of dirty) {
+      const t = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", id);
+      if (t) out.push(JSON.stringify({ type: "task", task: this.taskView(t, now) }));
+    }
+    if (roster) out.push(JSON.stringify({ type: "roster", roster: this.rosterView(now) }));
+    if (!out.length) return;
+    for (const ws of socks) {
+      try {
+        for (const m of out) ws.send(m);
+      } catch {
+        // A socket that cannot take a message is closed; the call that caused it is unaffected.
+        try {
+          ws.close(1011, "send failed");
+        } catch {
+          /* already closed */
+        }
+      }
+    }
+  }
+
+  /** The socket upgrade. Only the worker can reach this, and it sets x-room-human after the Access check. */
+  async fetch(req: Request): Promise<Response> {
+    if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "upgrade_required" }, 426);
+    const email = req.headers.get("x-room-human") ?? "";
+    const project = req.headers.get("x-room-project") ?? "";
+    if (!email || !project) return json({ error: "access_required" }, 403);
+    this.project = project;
+    if (this.openSockets().length >= LIMITS.maxSockets) return json({ error: "too_many_sockets" }, 429);
+    const me = this.commit((): AgentRow => {
+      const now = this.now();
+      this.sweep(now);
+      const row = this.ensureHuman(email, req.headers.get("x-room-ip") ?? "unknown", now);
+      this.touch(row, now);
+      return row;
+    });
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], [me.id]);
+    pair[1].send(JSON.stringify({ type: "hello", cursor: this.head() }));
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /** The socket only carries messages from the room; whatever a client sends is ignored. */
+  async webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {}
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    try {
+      ws.close(code === 1005 || code === 1006 ? 1000 : code, reason);
+    } catch {
+      /* already closed */
+    }
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    try {
+      ws.close(1011, "socket error");
+    } catch {
+      /* already closed */
     }
   }
 
@@ -322,9 +420,12 @@ export class ProjectRoom extends DurableObject<Env> {
     }
     for (const a of this.rows<AgentRow>("SELECT * FROM agents WHERE state = 'active'")) {
       const quiet = now - a.last_seen;
-      // A person is away after 10 quiet minutes and never gone.
+      // A person is present while a socket of theirs is open, away after 10 quiet minutes, never gone.
+      const here = a.kind === "human" && this.openSockets(a.id).length > 0;
       const next =
-        a.kind === "human" ? (quiet >= LIMITS.staleMs ? "stale" : "active") : quiet >= LIMITS.goneMs ? "gone" : quiet >= LIMITS.staleMs ? "stale" : "active";
+        a.kind === "human"
+          ? here || quiet < LIMITS.staleMs ? "active" : "stale"
+          : quiet >= LIMITS.goneMs ? "gone" : quiet >= LIMITS.staleMs ? "stale" : "active";
       if (next !== a.roster_state && next !== "active") {
         this.sql.exec("UPDATE agents SET roster_state = ? WHERE id = ?", next, a.id);
         this.event("roster", a.id, a.id, a.task_id, { name: a.name, state: next });
@@ -354,7 +455,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   async join(input: JoinInput & { project: string }): Promise<Result> {
     this.project = input.project;
-    return this.ctx.storage.transactionSync((): Result => {
+    return this.commit((): Result => {
       const now = this.now();
       this.sweep(now);
       let parent: AgentRow | undefined;
@@ -429,7 +530,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   async call(input: CallInput & { project: string }): Promise<Result> {
     this.project = input.project;
-    return this.ctx.storage.transactionSync((): Result => {
+    return this.commit((): Result => {
       const now = this.now();
       this.sweep(now);
       const me = this.agent(input.agentId);
@@ -443,7 +544,7 @@ export class ProjectRoom extends DurableObject<Env> {
   /** A call from a signed-in person. The worker has already verified the email. */
   async humanCall(input: HumanInput): Promise<Result> {
     this.project = input.project;
-    return this.ctx.storage.transactionSync((): Result => {
+    return this.commit((): Result => {
       const now = this.now();
       this.sweep(now);
       const me = this.ensureHuman(input.email, input.ip, now);
@@ -1000,6 +1101,7 @@ ${next.detail ?? ""}`);
       taskId, agentId, tokens, now,
     );
     this.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", now, taskId);
+    this.dirtyTasks.add(taskId);
   }
 
   /** The task's total across agents, or null when no agent has reported. */
@@ -1138,7 +1240,7 @@ ${next.detail ?? ""}`);
 
   /** Revoke (or ban) an agent and every subagent under it. With tokenHash, only when it matches. */
   async revoke(agentId: string, opts: { ban: boolean; rule: number; tokenHash?: string }): Promise<RevokeInfo> {
-    return this.ctx.storage.transactionSync(() => {
+    return this.commit(() => {
       const a = this.agent(agentId);
       // A person's access is the HUMANS list, so a token revoke has nothing to revoke.
       if (!a || a.kind === "human" || (opts.tokenHash && a.token_hash !== opts.tokenHash)) {

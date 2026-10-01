@@ -27,6 +27,17 @@ export async function handleHuman(env: Env, req: Request, url: URL, ip: string):
   const [, project, action] = m;
   if (!PROJECT_RE.test(project) || jsonMap(env.PROJECT_KEYS)[project] === undefined) return json({ error: "unknown_project" }, 404);
 
+  if (action === "ws") {
+    if (req.method !== "GET" || req.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "upgrade_required" }, 426);
+    if (req.headers.get("origin") !== url.origin) return json({ error: "bad_origin" }, 403);
+    // The room reads who this is from these headers. set() replaces anything the browser sent.
+    const headers = new Headers(req.headers);
+    headers.set("x-room-human", who.email);
+    headers.set("x-room-project", project);
+    headers.set("x-room-ip", ip);
+    return env.ROOM.get(env.ROOM.idFromName(project)).fetch(new Request(req, { headers }));
+  }
+
   const isGet = HUMAN_GET.has(action);
   if (!isGet && !HUMAN_POST.has(action)) return json({ error: "unknown_call", call: action }, 404);
   if (isGet !== (req.method === "GET")) return json({ error: "method_not_allowed", use: isGet ? "GET" : "POST" }, 405);

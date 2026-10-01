@@ -1,4 +1,4 @@
-import { SELF, env as rawEnv } from "cloudflare:test";
+import { SELF, env as rawEnv, runInDurableObject } from "cloudflare:test";
 import type { Res } from "./helpers";
 
 const enc = new TextEncoder();
@@ -54,4 +54,43 @@ export async function human(
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   });
   return { status: r.status, body: await r.json() };
+}
+
+/** Opens the room's socket as a signed-in person. `msgs` fills with parsed messages as they arrive. */
+export async function openSocket(
+  project: string,
+  opts: { email?: string; headers?: Record<string, string>; origin?: string | null } = {},
+): Promise<{ status: number; ws?: WebSocket; msgs: any[] }> {
+  const headers: Record<string, string> = {
+    Upgrade: "websocket",
+    "cf-connecting-ip": "10.250.0.1",
+    "cf-access-jwt-assertion": await accessJwt(opts.email),
+    ...(opts.headers ?? {}),
+  };
+  const origin = opts.origin === undefined ? "https://room.test" : opts.origin;
+  if (origin) headers.origin = origin;
+  const r = await SELF.fetch(`https://room.test/h/${project}/ws`, { headers });
+  const msgs: any[] = [];
+  if (r.status !== 101 || !r.webSocket) return { status: r.status, msgs };
+  const ws = r.webSocket;
+  ws.addEventListener("message", (e) => msgs.push(JSON.parse(String(e.data))));
+  ws.accept();
+  return { status: 101, ws, msgs };
+}
+
+/** Waits until `check` is true, polling every 10 ms; throws after `ms`. */
+export async function until(check: () => boolean | Promise<boolean>, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!(await check())) {
+    if (Date.now() > end) throw new Error("until: timed out");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** Closes every socket the room holds, so one test's sockets never count against another's. */
+export async function closeSockets(project: string): Promise<void> {
+  const stub = (rawEnv as any).ROOM.get((rawEnv as any).ROOM.idFromName(project));
+  await (runInDurableObject as any)(stub, async (_room: any, state: DurableObjectState) => {
+    for (const ws of state.getWebSockets()) ws.close(1000, "test over");
+  });
 }
