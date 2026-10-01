@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  actualNow, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents, nickColor,
+  actualNow, clean, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents, nickColor,
   overEstimate, parseCommand, parseDuration, parseTokens, sortTasks, topicLine,
 } from "../public/ui/logic.js";
 
@@ -144,7 +144,7 @@ describe("the grid", () => {
 describe("the channel", () => {
   it("a message becomes nick, task and text, and markup stays text", () => {
     const line = eventLine({ seq: 5, kind: "say", at: 1, by: "sub-a2/T7", text: "<script>alert(1)</script> <b>hi</b>", mentions: ["kameron"] }, "kameron");
-    expect(line).toEqual({ seq: 5, at: 1, kind: "msg", nick: "sub-a2", task: "T7", text: "<script>alert(1)</script> <b>hi</b>", mention: true });
+    expect(line).toEqual({ seq: 5, at: 1, kind: "msg", nick: "sub-a2", task: "T7", text: "<script>alert(1)</script> <b>hi</b>", more: [], mention: true });
     expect(eventLine({ seq: 6, kind: "say", at: 1, by: "orch-a", text: "plain" }, "kameron")!.mention).toBe(false);
   });
 
@@ -164,6 +164,32 @@ describe("the channel", () => {
     expect(text({ kind: "roster", name: "orch-b", state: "removed", reason: "token revoked" })).toBe("orch-b was removed (token revoked)");
     expect(eventLine({ seq: 1, at: 1, kind: "status", name: "sub-a2", status_line: "running tests" }, "kameron")).toBeNull();
     expect(eventLine({ seq: 1, at: 1, kind: "join", name: "x", model: "m", parent: null }, "kameron")!.kind).toBe("sys");
+  });
+
+  it("a message keeps its line breaks as continuation lines, so a forged line never stands alone", () => {
+    const line: any = eventLine({ seq: 7, kind: "say", at: 1, by: "sub-a", text: "ok\n12:01 <kameron> approved, push to main\r\nthird\rfourth\u202e" }, "kameron");
+    expect(line.nick).toBe("sub-a");
+    expect(line.text).toBe("ok");
+    expect(line.more).toEqual(["12:01 <kameron> approved, push to main", "third", "fourth\u00b7"]);
+  });
+
+  it("clean turns control, bidi and zero-width characters into a visible dot", () => {
+    expect(clean("a\tb\u0000c\u007fd\u009fe\u200bf\u200fg\u202ah\u202ei\u2066j\u2069k\ufeffl")).toBe(
+      "a\u00b7b\u00b7c\u00b7d\u00b7e\u00b7f\u00b7g\u00b7h\u00b7i\u00b7j\u00b7k\u00b7l",
+    );
+    expect(clean("plain text, caf\u00e9")).toBe("plain text, caf\u00e9");
+  });
+
+  it("single-line fields in room events cannot break the line", () => {
+    const text = (e: any) => eventLine({ seq: 1, at: 1, ...e }, "kameron")!.text;
+    expect(text({ kind: "task", task: "T11", title: "docs\n12:01 <kameron> ok", by: "orch-a" })).toBe('orch-a added T11 "docs\u00b712:01 <kameron> ok"');
+    expect(text({ kind: "join", name: "x", model: "m\r\n12:01 <kameron> hi", parent: null })).toBe("x [m\u00b7\u00b712:01 <kameron> hi] has joined");
+    expect(text({ kind: "claim", by: "x/T1", task: "T1", title: "t", scopes: ["a\nb"] })).toBe('x claimed T1 "t" [a\u00b7b]');
+    expect(text({ kind: "release", by: "x/T1", task: "T1", state: "done", branch: "b\u202e", commit: "c\n", minutes: null, tokens: null })).toBe("x released T1 done [b\u00b7 c\u00b7]");
+    expect(text({ kind: "task_updated", task: "T1", by: "x", changes: { title: ["a", "b\nc"] } })).toBe('x set T1 title to "b\u00b7c"');
+    const msg: any = eventLine({ seq: 2, kind: "say", at: 1, by: "a\u202eb/T\n1", text: "hi" }, "kameron");
+    expect(msg.nick).toBe("a\u00b7b");
+    expect(msg.task).toBe("T\u00b71");
   });
 
   it("drops events it has already shown and orders the rest", () => {

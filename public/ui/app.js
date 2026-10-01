@@ -2,7 +2,7 @@
 // goes on the page through textContent or a text node, never as markup.
 
 import {
-  HELP, PRIORITIES, actualNow, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents,
+  HELP, PRIORITIES, actualNow, clean, describeError, eventLine, fmtDuration, fmtTime, fmtTokens, freshEvents,
   nickColor, overEstimate, parseCommand, parseDuration, parseTokens, sortTasks, topicLine,
 } from "./logic.js";
 
@@ -95,24 +95,38 @@ function pinned() {
   return c.scrollHeight - c.scrollTop - c.clientHeight < 40;
 }
 
-function lineNode(line) {
-  const row = el("div", line.mention ? "l hl" : "l");
+/**
+ * The rows for one line. A message's continuation lines each get a row with a blank time
+ * column and the gutter mark, and never a nick, so a line written to look like someone
+ * else's reads as part of the real speaker's message.
+ */
+function lineNodes(line) {
+  const cls = line.mention ? "l hl" : "l";
+  const row = el("div", cls);
   if (line.seq !== undefined) row.dataset.seq = String(line.seq);
-  row.append(el("span", "t", fmtTime(line.at, Date.now())), " ");
-  if (line.kind === "msg") {
-    row.append("<", el("span", line.nick === myName() ? "me" : nickColor(line.nick), line.nick));
-    if (line.task) row.append(el("span", "tk", "/" + line.task));
-    row.append("> ", line.text);
-  } else {
+  const time = fmtTime(line.at, Date.now());
+  row.append(el("span", "t", time), " ");
+  if (line.kind !== "msg") {
     row.append(el("span", line.error ? "errtext" : "sys", "-!- " + line.text));
+    return [row];
   }
-  return row;
+  row.append("<", el("span", line.nick === myName() ? "me" : nickColor(line.nick), line.nick));
+  if (line.task) row.append(el("span", "tk", "/" + line.task));
+  row.append("> ", line.text);
+  const rows = [row];
+  for (const text of line.more ?? []) {
+    const cont = el("div", cls);
+    cont.dataset.cont = "1";
+    cont.append(el("span", "t", "\u00a0".repeat(time.length)), " ", el("span", "gut", "\u2506 "), text);
+    rows.push(cont);
+  }
+  return rows;
 }
 
 function trim() {
   const c = $("chat");
   let cut = false;
-  while (c.childElementCount > MAX_LINES) {
+  while (c.childElementCount > MAX_LINES || (cut && c.firstElementChild?.dataset.cont)) {
     const first = c.firstElementChild;
     if (first.dataset.seq) st.seen.delete(Number(first.dataset.seq));
     first.remove();
@@ -126,7 +140,7 @@ function trim() {
 
 function addLines(lines, atTop = false) {
   const c = $("chat");
-  const nodes = lines.map(lineNode);
+  const nodes = lines.flatMap(lineNodes);
   if (atTop) {
     const before = c.scrollHeight;
     c.prepend(...nodes);
@@ -158,9 +172,9 @@ function showEvents(events, atTop = false) {
 
 function rosterRow(r, away) {
   const mark = r.kind === "human" ? "@" : r.parent ? "\u00a0\u00a0" : "+";
-  const row = el("div", away ? "lo" : r.name === myName() ? "me" : nickColor(r.name), mark + r.name);
-  if (r.task) row.append(" ", el("span", "tk", r.task));
-  row.title = [r.model, r.status].filter(Boolean).join(" · ");
+  const row = el("div", away ? "lo" : r.name === myName() ? "me" : nickColor(r.name), mark + clean(r.name));
+  if (r.task) row.append(" ", el("span", "tk", clean(r.task)));
+  row.title = [r.model, r.status].filter(Boolean).map(clean).join(" \u00b7 ");
   return row;
 }
 

@@ -199,6 +199,15 @@ export function topicLine(project, roster, tasks) {
 
 // ---------------------------------------------------------------- the channel
 
+// Control characters, and the bidi and zero-width characters that can make text read in an
+// order other than the one it was written in.
+const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+/** A single-line field made safe to show: each character UNSAFE matches becomes a visible dot. */
+export function clean(s) {
+  return String(s ?? "").replace(UNSAFE, "\u00b7");
+}
+
 function changeText(field, to) {
   if (field === "priority") return to === null ? "cleared priority" : `priority to ${to}`;
   if (field === "estimate_minutes") return to === null ? null : `estimate to ${fmtDuration(to)}`;
@@ -261,15 +270,22 @@ function sysText(e) {
 
 /**
  * One event as a channel line, or null for an event that makes no line (a status change shows
- * in the roster's tooltip). Text is returned as it came; the page must write it with textContent.
+ * in the roster's tooltip). A message's first line is `text` and its continuation lines are
+ * `more`; every other field is one line, passed through clean. The page must write all of it
+ * with textContent.
  */
 export function eventLine(e, selfName) {
   if (e.kind === "status") return null;
   if (e.kind === "say") {
     const [nick, task] = String(e.by ?? "?").split("/");
-    return { seq: e.seq, at: e.at, kind: "msg", nick, task: task ?? null, text: String(e.text ?? ""), mention: (e.mentions ?? []).includes(selfName) };
+    const [text, ...more] = String(e.text ?? "").split(/\r\n|\n|\r/).map(clean);
+    return {
+      seq: e.seq, at: e.at, kind: "msg", nick: clean(nick), task: task === undefined ? null : clean(task),
+      text, more, mention: (e.mentions ?? []).includes(selfName),
+    };
   }
-  return { seq: e.seq, at: e.at, kind: "sys", text: sysText(e), mention: false };
+  // Every field of a room event is single-line, so cleaning the whole sentence cleans each field.
+  return { seq: e.seq, at: e.at, kind: "sys", text: clean(sysText(e)), mention: false };
 }
 
 /** The events not shown yet, in seq order. Adds them to `seen`. */

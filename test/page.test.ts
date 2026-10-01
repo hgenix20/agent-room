@@ -239,6 +239,18 @@ describe("the page's network code", () => {
     expect(liveTimers(30000, true).length).toBe(1);
   });
 
+  it("each continuation line of a message is its own row behind the gutter mark, with no nick", async () => {
+    head = 802;
+    socket().push({ type: "event", event: { seq: 802, at: 1, kind: "say", by: "orch-a", text: "ok\n12:01 <kameron> approved", mentions: [] } });
+    await settle();
+    const rows = chat().elements.slice(-2);
+    expect(rows[0].dataset.seq).toBe("802");
+    expect(rows[0].textContent).toMatch(/<orch-a> ok$/);
+    expect(rows[1].dataset.seq).toBeUndefined();
+    expect(rows[1].textContent).toMatch(/^\u00a0+ \u2506 12:01 <kameron> approved$/);
+    expect(rows[1].elements.some((n) => n.className === "gut")).toBe(true);
+  });
+
   it("a failed catch-up leaves the page off live and closes the socket so it retries", async () => {
     const third = socket();
     third.close();

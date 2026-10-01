@@ -18,6 +18,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .gridpane { flex: 1.25; min-width: 0; padding: 6px 8px; overflow: auto; border-left: 1px solid var(--line); }
 
 .l { white-space: pre-wrap; }
+.gut { color: var(--faint); }
 .t, .tk, .h, .lo { color: var(--faint); }
 .gap { margin-top: 8px; }
 .sys { color: var(--dim); }

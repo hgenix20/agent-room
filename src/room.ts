@@ -495,7 +495,8 @@ export class ProjectRoom extends DurableObject<Env> {
         }
       }
       if (!NAME_RE.test(input.name)) return { status: 400, body: { error: "bad_name", detail: "letters, digits, . _ - up to 40" } };
-      const model = String(input.model || "unknown").slice(0, 80);
+      if (reserved(input.name)) return { status: 400, body: { error: "bad_name", detail: "that name is reserved" } };
+      const model = oneLine(String(input.model || "unknown").slice(0, 80));
       let name = input.name;
       for (let i = 2; this.nameTaken(name, now); i++) name = `${input.name}-${i}`;
       this.sql.exec(
@@ -592,8 +593,10 @@ export class ProjectRoom extends DurableObject<Env> {
     return r;
   }
 
-  private nameTaken(name: string, now: number): boolean {
-    return this.rows<AgentRow>("SELECT * FROM agents WHERE name = ? AND state = 'active'", name).some((a) => this.alive(a, now));
+  /** True when a live row other than `exceptId` has this name, compared without regard to case. */
+  private nameTaken(name: string, now: number, exceptId: string | null = null): boolean {
+    return this.rows<AgentRow>("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND state = 'active'", name)
+      .some((a) => a.id !== exceptId && this.alive(a, now));
   }
 
   /** The person's row for this email, made on their first call. One row per email per room. */
@@ -607,7 +610,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const local = email.split("@")[0].replace(/[^A-Za-z0-9._-]/g, "").replace(/^[^A-Za-z0-9]+/, "");
     const base = local.slice(0, LIMITS.nameChars - 4) || "human";
     let name = base;
-    for (let i = 2; name === "moderator" || this.nameTaken(name, now); i++) name = `${base}-${i}`;
+    for (let i = 2; reserved(name) || this.nameTaken(name, now); i++) name = `${base}-${i}`;
     const id = newAgentId();
     this.sql.exec(
       `INSERT INTO agents (id, name, model, parent_id, token_hash, last_seen, tree_seen, joined_at, cred_label, ip, kind, email)
@@ -622,7 +625,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const name = str(body.name, "name", LIMITS.nameChars, true);
     if (!NAME_RE.test(name)) throw new HttpError(400, { error: "bad_name", detail: "letters, digits, . _ - up to 40" });
     if (name === me.name) return { status: 200, body: { name } };
-    if (name === "moderator" || this.nameTaken(name, now)) throw new HttpError(409, { error: "name_taken", name });
+    if (reserved(name) || this.nameTaken(name, now, me.id)) throw new HttpError(409, { error: "name_taken", name });
     this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", name, me.id);
     this.event("roster", me.id, me.id, null, { name, state: "renamed", was: me.name });
     return { status: 200, body: { name } };
@@ -794,7 +797,7 @@ export class ProjectRoom extends DurableObject<Env> {
   private heartbeat(me: AgentRow, body: Record<string, unknown>, now: number): Result {
     const tokens = body.tokens_used === undefined || body.tokens_used === null ? null : intOf(body.tokens_used, "bad_tokens_used", 0, LIMITS.tokensMax);
     let tokensIgnored = false;
-    const status = body.status_line === undefined ? me.status_line : str(body.status_line, "status_line", LIMITS.statusChars);
+    const status = body.status_line === undefined ? me.status_line : oneLine(str(body.status_line, "status_line", LIMITS.statusChars));
     checkSecret(status);
     const leaseMs = body.lease === undefined ? null : leaseOf(body.lease);
     let task = me.task_id;
@@ -876,7 +879,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private createTask(me: AgentRow, body: Record<string, unknown>, now: number): Result {
-    const title = str(body.title, "title", LIMITS.titleChars, true);
+    const title = oneLine(str(body.title, "title", LIMITS.titleChars, true));
     const detail = body.detail === undefined ? "" : str(body.detail, "detail", LIMITS.messageChars);
     checkSecret(title + "\n" + detail);
     const deps = body.depends_on === undefined || body.depends_on === null ? [] : body.depends_on;
@@ -921,7 +924,7 @@ export class ProjectRoom extends DurableObject<Env> {
     if (me.kind !== "human" && !mine) throw new HttpError(403, { error: "not_yours", detail: "you can update a task you created or hold a claim on" });
 
     const next: Record<string, string | number | null> = {};
-    if (body.title !== undefined) next.title = str(body.title, "title", LIMITS.titleChars, true);
+    if (body.title !== undefined) next.title = oneLine(str(body.title, "title", LIMITS.titleChars, true));
     if (body.detail !== undefined) next.detail = body.detail === null ? "" : str(body.detail, "detail", LIMITS.messageChars);
     if (body.priority !== undefined) next.priority = priorityOf(body.priority);
     if (body.estimate_minutes !== undefined) {
@@ -1302,6 +1305,16 @@ function similarity(a: string, b: string): number {
 function checkSecret(text: string): void {
   const r = secretReason(text);
   if (r) throw new SecretRefused(r);
+}
+
+/** A single-line field stored as one line: each control character becomes a space. Never refuses. */
+function oneLine(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+}
+
+/** The room's own speaker; nobody may take the name, in any letter case. */
+function reserved(name: string): boolean {
+  return name.toLowerCase() === "moderator";
 }
 
 function str(v: unknown, field: string, max: number, required = false): string {
