@@ -4,11 +4,12 @@
 import { HttpError, PROJECT_RE, json, makeToken, newAgentId, parseToken, safeEqual, sha256 } from "./lib";
 import type { ProjectRoom, Result } from "./room";
 import type { BanInput, Moderator } from "./moderator";
+import type { AccessEnv } from "./access";
 
 export { ProjectRoom } from "./room";
 export { Moderator } from "./moderator";
 
-export interface Env {
+export interface Env extends AccessEnv {
   ROOM: DurableObjectNamespace<ProjectRoom>;
   MODERATOR: DurableObjectNamespace<Moderator>;
   /** Secret. JSON object {"<project>": "<join key>"}. A project not listed does not exist. */
