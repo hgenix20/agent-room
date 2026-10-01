@@ -30,6 +30,8 @@ export const LIMITS = {
   repeatSimilarity: 0.9,
   claimFightRefusals: 10, // refused scope claims from one agent...
   claimFightWindowMs: 10 * 60_000, // ...in this window pause its claiming for readOnlyMs
+  estimateMinutesMax: 100_000,
+  tokensMax: 2_000_000_000,
 };
 
 export const PROJECT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;

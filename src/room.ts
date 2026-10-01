@@ -102,6 +102,11 @@ interface TaskRow {
   commit_sha: string | null;
   created_by: string;
   updated_at: number;
+  priority: string;
+  estimate_minutes: number | null;
+  estimate_tokens: number | null;
+  started_at: number | null;
+  ended_at: number | null;
   [k: string]: SqlStorageValue;
 }
 
@@ -155,11 +160,38 @@ export class ProjectRoom extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS strikes (agent_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS claim_lock (agent_id TEXT PRIMARY KEY, until INTEGER NOT NULL);
     `);
-    if (!this.sql.exec<{ name: string }>("PRAGMA table_info(agents)").toArray().some((c) => c.name === "orphaned")) {
-      this.sql.exec("ALTER TABLE agents ADD COLUMN orphaned INTEGER NOT NULL DEFAULT 0");
-    }
+    this.migrate();
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
     if (off) this.offset = Number(off.v);
+  }
+
+  private addColumn(table: string, column: string, ddl: string): void {
+    if (!this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().some((c) => c.name === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
+  }
+
+  /** Brings a room made by an older version up to this one. Safe to run again. */
+  private migrate(): void {
+    this.addColumn("agents", "orphaned", "orphaned INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("tasks", "priority", "priority TEXT NOT NULL DEFAULT 'normal'");
+    this.addColumn("tasks", "estimate_minutes", "estimate_minutes INTEGER");
+    this.addColumn("tasks", "estimate_tokens", "estimate_tokens INTEGER");
+    this.addColumn("tasks", "started_at", "started_at INTEGER");
+    this.addColumn("tasks", "ended_at", "ended_at INTEGER");
+    if (!this.sql.exec("SELECT v FROM meta WHERE k = 'task_times_backfilled'").toArray().length) {
+      // Tasks from before these columns: the claim and release events already hold the times.
+      this.sql.exec(
+        `UPDATE tasks SET started_at = (SELECT MIN(e.created_at) FROM events e WHERE e.kind = 'claim' AND e.task_id = tasks.id)
+         WHERE started_at IS NULL`,
+      );
+      this.sql.exec(
+        `UPDATE tasks SET ended_at = (SELECT MAX(e.created_at) FROM events e
+           WHERE e.kind = 'release' AND e.task_id = tasks.id AND json_extract(e.data, '$.state') = 'done')
+         WHERE state = 'done' AND ended_at IS NULL`,
+      );
+      this.sql.exec("INSERT INTO meta (k, v) VALUES ('task_times_backfilled', '1') ON CONFLICT(k) DO NOTHING");
+    }
   }
 
   // ------------------------------------------------------------------ basics
@@ -664,14 +696,26 @@ export class ProjectRoom extends DurableObject<Env> {
       parentTask = str(body.parent_task, "parent_task", 40);
       if (!this.first("SELECT id FROM tasks WHERE id = ?", parentTask)) throw new HttpError(400, { error: "unknown_task", task: parentTask });
     }
+    const priority = body.priority === undefined ? "normal" : priorityOf(body.priority);
+    const estMinutes =
+      body.estimate_minutes === undefined || body.estimate_minutes === null
+        ? null
+        : intOf(body.estimate_minutes, "bad_estimate_minutes", 1, LIMITS.estimateMinutesMax);
+    const estTokens =
+      body.estimate_tokens === undefined || body.estimate_tokens === null
+        ? null
+        : intOf(body.estimate_tokens, "bad_estimate_tokens", 0, LIMITS.tokensMax);
     const num = this.counter("task_num");
     const id = `T${num}`;
     this.sql.exec(
-      `INSERT INTO tasks (id, num, title, detail, state, parent_task, depends_on, created_by, updated_at)
-       VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
-      id, num, title, detail, parentTask, JSON.stringify(deps), me.id, now,
+      `INSERT INTO tasks (id, num, title, detail, state, parent_task, depends_on, created_by, updated_at, priority, estimate_minutes, estimate_tokens)
+       VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)`,
+      id, num, title, detail, parentTask, JSON.stringify(deps), me.id, now, priority, estMinutes, estTokens,
     );
-    this.event("task", id, me.id, id, { task: id, title, by: me.name, depends_on: deps, parent_task: parentTask });
+    this.event("task", id, me.id, id, {
+      task: id, title, by: me.name, depends_on: deps, parent_task: parentTask,
+      priority, estimate_minutes: estMinutes, estimate_tokens: estTokens,
+    });
     return { status: 200, body: { task_id: id } };
   }
 
@@ -719,7 +763,10 @@ export class ProjectRoom extends DurableObject<Env> {
       "INSERT INTO claims (id, task_id, owner_id, scopes, version, lease_ms, expires_at, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?)",
       id, taskId, me.id, JSON.stringify(scopes), version, leaseMs, expires, now,
     );
-    this.sql.exec("UPDATE tasks SET state = 'claimed', owner_id = ?, updated_at = ? WHERE id = ?", me.id, now, taskId);
+    this.sql.exec(
+      "UPDATE tasks SET state = 'claimed', owner_id = ?, updated_at = ?, started_at = COALESCE(started_at, ?), ended_at = NULL WHERE id = ?",
+      me.id, now, now, taskId,
+    );
     this.sql.exec("UPDATE agents SET task_id = ? WHERE id = ?", taskId, me.id);
     this.event("claim", id, me.id, taskId, { by: this.label(me, taskId), task: taskId, title: task.title, scopes, claim_id: id, version, lease_s: leaseMs / 1000 });
     const deps: string[] = JSON.parse(task.depends_on);
@@ -787,6 +834,7 @@ export class ProjectRoom extends DurableObject<Env> {
         "UPDATE tasks SET state = ?, owner_id = ?, branch = COALESCE(?, branch), commit_sha = COALESCE(?, commit_sha), updated_at = ? WHERE id = ?",
         state, me.id, branch, commit, now, c.task_id,
       );
+      if (state === "done") this.sql.exec("UPDATE tasks SET ended_at = ? WHERE id = ?", now, c.task_id);
       this.sql.exec("UPDATE agents SET task_id = NULL WHERE id = ? AND task_id = ?", me.id, c.task_id);
       this.event("release", c.id, me.id, c.task_id, { by: this.label(me, c.task_id), task: c.task_id, state, commit, branch, claim_id: c.id });
       released.push({ claim_id: c.id, task_id: c.task_id, state });
@@ -801,22 +849,31 @@ export class ProjectRoom extends DurableObject<Env> {
     return { status: 200, body: { ok: true, released: r.body.released } };
   }
 
+  private taskView(t: TaskRow, now: number): Record<string, unknown> {
+    const c = this.first<ClaimRow>("SELECT * FROM claims WHERE task_id = ? AND state = 'live'", t.id);
+    return {
+      id: t.id,
+      title: t.title,
+      detail: t.detail || undefined,
+      state: t.state,
+      owner: this.nameOf(t.owner_id),
+      branch: t.branch,
+      commit: t.commit_sha,
+      parent_task: t.parent_task,
+      depends_on: JSON.parse(t.depends_on),
+      claim: c ? { scopes: JSON.parse(c.scopes), expires_in_s: Math.round((c.expires_at - now) / 1000) } : undefined,
+      priority: t.priority,
+      estimate_minutes: t.estimate_minutes,
+      estimate_tokens: t.estimate_tokens,
+      started_at: t.started_at,
+      ended_at: t.ended_at,
+      actual_minutes: actualMinutes(t, now),
+      rev: t.updated_at,
+    };
+  }
+
   private board(now: number): Result {
-    const tasks = this.rows<TaskRow>("SELECT * FROM tasks ORDER BY num").map((t) => {
-      const c = this.first<ClaimRow>("SELECT * FROM claims WHERE task_id = ? AND state = 'live'", t.id);
-      return {
-        id: t.id,
-        title: t.title,
-        detail: t.detail || undefined,
-        state: t.state,
-        owner: this.nameOf(t.owner_id),
-        branch: t.branch,
-        commit: t.commit_sha,
-        parent_task: t.parent_task,
-        depends_on: JSON.parse(t.depends_on),
-        claim: c ? { scopes: JSON.parse(c.scopes), expires_in_s: Math.round((c.expires_at - now) / 1000) } : undefined,
-      };
-    });
+    const tasks = this.rows<TaskRow>("SELECT * FROM tasks ORDER BY num").map((t) => this.taskView(t, now));
     return { status: 200, body: { tasks } };
   }
 
@@ -985,6 +1042,27 @@ function str(v: unknown, field: string, max: number, required = false): string {
   if (typeof v !== "string") throw new HttpError(400, { error: "not_a_string", field });
   if (v.length > max) throw new HttpError(400, { error: "too_long", field, max });
   return v;
+}
+
+const PRIORITIES = new Set(["urgent", "high", "normal", "low"]);
+
+function priorityOf(v: unknown): string {
+  if (typeof v !== "string" || !PRIORITIES.has(v)) throw new HttpError(400, { error: "bad_priority", detail: "urgent, high, normal or low" });
+  return v;
+}
+
+function intOf(v: unknown, error: string, min: number, max: number): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
+    throw new HttpError(400, { error, detail: `whole number ${min} to ${max}` });
+  }
+  return v;
+}
+
+/** Wall-clock minutes from first claim to done, or so far while claimed; null otherwise. */
+function actualMinutes(t: TaskRow, now: number): number | null {
+  if (t.started_at === null) return null;
+  const end = t.ended_at ?? (t.state === "claimed" ? now : null);
+  return end === null ? null : Math.max(0, Math.round((end - t.started_at) / 60_000));
 }
 
 function leaseOf(v: unknown): number {
