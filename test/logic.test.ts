@@ -97,12 +97,15 @@ describe("parsing what a person types", () => {
     expect(unknown.message).toContain("/task add");
   });
 
-  it("a capital M is million tokens, so est:1M and /est T8 1M are refused", () => {
-    for (const line of ["/task add x est:1M", "/est T8 1M"]) {
-      const r = cmd(line);
-      expect(r.kind).toBe("error");
-      expect(r.message).toContain("a capital M means million tokens");
-    }
+  it("a capital M is million tokens: est:1M is refused, /est reads it as tokens", () => {
+    const r = cmd("/task add x est:1M");
+    expect(r.kind).toBe("error");
+    expect(r.message).toContain("a capital M means million tokens");
+    expect(r.message).toContain("45m or 1h30m");
+    expect(cmd("/est T8 1M")).toEqual({ kind: "call", action: "task_update", body: { task_id: "T8", estimate_tokens: 1000000 } });
+    expect(cmd("/est T8 90m 1.4M")).toEqual({ kind: "call", action: "task_update", body: { task_id: "T8", estimate_minutes: 90, estimate_tokens: 1400000 } });
+    expect(parseDuration("1M")).toBeNull();
+    expect(parseTokens("1M")).toBe(1000000);
   });
 
   it("the add of /task add is matched in any case", () => {

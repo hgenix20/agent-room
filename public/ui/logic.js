@@ -44,8 +44,9 @@ export function fmtTime(ms, nowMs) {
 
 // ---------------------------------------------------------------- parsing
 
-/** "45m", "2h", "1h30m" or a bare number of minutes -> minutes 1..100000, else null. */
+/** "45m", "2h", "1h30m" or a bare number of minutes -> minutes 1..100000, else null. A capital M is million tokens, never minutes. */
 export function parseDuration(s) {
+  if (/M/.test(String(s))) return null;
   const t = String(s).trim().toLowerCase().replace(/\s+/g, "");
   let minutes;
   if (/^\d+$/.test(t)) minutes = Number(t);
@@ -105,7 +106,7 @@ export function parseCommand(line) {
         if (!PRIORITIES.includes(pri[1].toLowerCase())) return err(`priority is one of ${PRIORITIES.join(", ")}`);
         body.priority = pri[1].toLowerCase();
       } else if (est) {
-        if (/M$/.test(est[1])) return err(`est: takes a time such as 45m; ${CAPITAL_M}`);
+        if (/M$/.test(est[1])) return err(`est: takes a time; ${CAPITAL_M}, and time is written like 45m or 1h30m`);
         const minutes = parseDuration(est[1]);
         if (minutes === null) return err("est: takes a time such as 45m or 1h30m");
         body.estimate_minutes = minutes;
@@ -131,7 +132,6 @@ export function parseCommand(line) {
     if (w.length < 2 || w.length > 3 || !TASK_ID.test(w[0].v)) return err(usage);
     const body = { task_id: w[0].v };
     for (const x of w.slice(1)) {
-      if (/M$/.test(x.v)) return err(`${CAPITAL_M}. write 90m for time or 70k for tokens`);
       if (/[hm]$/.test(x.v)) {
         const minutes = parseDuration(x.v);
         if (minutes === null) return err("that time is not valid. " + usage);

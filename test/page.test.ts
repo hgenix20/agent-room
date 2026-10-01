@@ -257,6 +257,26 @@ describe("the page's network code", () => {
     expect(rows[1].elements.some((n) => n.className === "gut")).toBe(true);
   });
 
+  it("grid text cells pass through clean: title, owner and the detail tooltip", async () => {
+    socket().push({
+      type: "task",
+      task: { id: "T1", title: "fix\u202elogin", owner: "sub\u200ba", detail: "see\u2066notes", state: "claimed", priority: "normal", rev: 1 },
+    });
+    await settle();
+    const cells: Node[] = [];
+    const walk = (n: Node) => {
+      for (const c of n.elements) {
+        if (c.tag === "td") cells.push(c);
+        walk(c);
+      }
+    };
+    walk(nodes.gridpane);
+    const title = cells.find((c) => c.textContent.startsWith("fix"))!;
+    expect(title.textContent).toBe("fix\u00b7login");
+    expect(title.title).toBe("see\u00b7notes");
+    expect(cells.some((c) => c.textContent === "sub\u00b7a")).toBe(true);
+  });
+
   it("the input is cleared only when the room takes the line, and a refused line comes back", async () => {
     const send = async (text: string, clearMeanwhile = false) => {
       nodes.input.value = text;

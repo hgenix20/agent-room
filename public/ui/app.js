@@ -202,7 +202,7 @@ function applyTask(project, t) {
 function cellText(t, col) {
   const now = Date.now();
   switch (col) {
-    case "owner": return t.owner ?? "";
+    case "owner": return clean(t.owner ?? "");
     case "estimate_minutes": return fmtDuration(t.estimate_minutes);
     case "estimate_tokens": return fmtTokens(t.estimate_tokens);
     case "started_at": return fmtTime(t.started_at, now);
@@ -212,7 +212,7 @@ function cellText(t, col) {
       return m === null ? "" : fmtDuration(m) + (t.state === "claimed" ? "…" : "");
     }
     case "tokens_used": return fmtTokens(t.tokens_used);
-    default: return String(t[col] ?? "");
+    default: return clean(String(t[col] ?? ""));
   }
 }
 
@@ -261,7 +261,7 @@ function renderGrid() {
       const tr = el("tr");
       for (const [col] of COLS) {
         const td = el("td", `${NUMERIC.has(col) ? "r " : ""}${cellClass(t, col)}`.trim(), cellText(t, col));
-        if (col === "title" && t.detail) td.title = t.detail;
+        if (col === "title" && t.detail) td.title = clean(t.detail);
         if (EDITABLE.has(col)) {
           td.classList.add("edit");
           td.addEventListener("click", () => editCell(td, project, t, col));
