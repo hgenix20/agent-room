@@ -9,8 +9,10 @@ export interface AccessEnv {
   ACCESS_AUD?: string;
   /** Secret: JSON array of the emails allowed to act as people in the room. */
   HUMANS?: string;
-  /** Test only: a JWKS used in place of fetching the team's certs. Never set in production. */
+  /** Test only: a JWKS used in place of fetching the team's certs, honored only with ALLOW_TEST_CLOCK. */
   ACCESS_TEST_JWKS?: string;
+  /** Test only: "1" in the test run. Never set in production. */
+  ALLOW_TEST_CLOCK?: string;
 }
 
 export type AccessResult = { ok: true; email: string } | { ok: false; status: number; error: string; detail: string };
@@ -18,14 +20,21 @@ export type AccessResult = { ok: true; email: string } | { ok: false; status: nu
 type Jwk = JsonWebKey & { kid?: string };
 
 const CERT_TTL_MS = 60 * 60_000;
+// An unknown key id forces a certs fetch at most this often, so a stream of made-up key ids
+// cannot make the worker fetch on every request.
+const REFETCH_GAP_MS = 60_000;
+// An email is printable ASCII only, so lowercasing cannot fold another character into a listed one.
+const EMAIL_CHARS = /^[!-~]+$/;
 const SLACK_S = 60;
 const RSA = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
 
 let certCache: { at: number; domain: string; keys: Jwk[] } | null = null;
+let lastForcedFetch = Number.NEGATIVE_INFINITY;
 
-/** Test hook: forget the cached certs. */
+/** Test hook: forget the cached certs and when a refetch was last forced. */
 export function _resetCertCache(): void {
   certCache = null;
+  lastForcedFetch = Number.NEGATIVE_INFINITY;
 }
 
 function refuse(detail: string): AccessResult {
@@ -58,7 +67,11 @@ function allowList(raw: string | undefined): string[] | null {
   try {
     const v = JSON.parse(raw);
     if (!Array.isArray(v)) return null;
-    const emails = v.filter((x): x is string => typeof x === "string").map((x) => x.trim().toLowerCase()).filter(Boolean);
+    const emails = v
+      .filter((x): x is string => typeof x === "string")
+      .map((x) => x.trim())
+      .filter((x) => EMAIL_CHARS.test(x))
+      .map((x) => x.toLowerCase());
     return emails.length ? emails : null;
   } catch {
     return null;
@@ -66,7 +79,7 @@ function allowList(raw: string | undefined): string[] | null {
 }
 
 async function keysFor(env: AccessEnv, domain: string, fetcher: (url: string) => Promise<Response>, force: boolean): Promise<Jwk[]> {
-  if (env.ACCESS_TEST_JWKS) {
+  if (env.ACCESS_TEST_JWKS && env.ALLOW_TEST_CLOCK === "1") {
     const v = JSON.parse(env.ACCESS_TEST_JWKS) as { keys?: Jwk[] };
     return Array.isArray(v.keys) ? v.keys : [];
   }
@@ -82,7 +95,7 @@ async function keysFor(env: AccessEnv, domain: string, fetcher: (url: string) =>
 /**
  * Checks the Cf-Access-Jwt-Assertion header: RS256 signature against the team's keys, audience,
  * issuer, expiry (60 s of slack), and that the email is on the HUMANS list.
- * 503 when the settings are missing; 403 for every other failure.
+ * 503 when the settings are missing or the team's certs cannot be read; 403 for every other failure.
  */
 export async function verifyAccess(
   req: Request,
@@ -109,9 +122,13 @@ export async function verifyAccess(
   let key: Jwk | undefined;
   try {
     key = (await keysFor(env, domain, fetcher, false)).find((k) => k.kid === head.kid);
-    if (!key) key = (await keysFor(env, domain, fetcher, true)).find((k) => k.kid === head.kid);
+    if (!key && nowMs - lastForcedFetch >= REFETCH_GAP_MS) {
+      lastForcedFetch = nowMs;
+      key = (await keysFor(env, domain, fetcher, true)).find((k) => k.kid === head.kid);
+    }
   } catch {
-    return refuse("the team's certs could not be read");
+    // Not the person's fault: the page must not tell them their session expired.
+    return { ok: false, status: 503, error: "access_unavailable", detail: "the team's certs could not be read" };
   }
   if (!key) return refuse("token signed with an unknown key");
 
@@ -129,9 +146,12 @@ export async function verifyAccess(
   if (claims.iss !== `https://${domain}`) return refuse("token is from another issuer");
   const now = Math.floor(nowMs / 1000);
   if (typeof claims.exp !== "number" || claims.exp < now - SLACK_S) return refuse("token has expired");
+  if (claims.nbf !== undefined && typeof claims.nbf !== "number") return refuse("token has a malformed nbf");
   if (typeof claims.nbf === "number" && claims.nbf > now + SLACK_S) return refuse("token is not valid yet");
   if (typeof claims.email !== "string") return refuse("token names no email");
-  const email = claims.email.trim().toLowerCase();
+  const trimmed = claims.email.trim();
+  if (!EMAIL_CHARS.test(trimmed)) return refuse("token email has a character outside printable ASCII");
+  const email = trimmed.toLowerCase();
   if (!humans.includes(email)) return refuse("this email is not on the room's list");
   return { ok: true, email };
 }

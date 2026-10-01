@@ -11,9 +11,12 @@ function b64url(input: ArrayBuffer | Uint8Array): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** A compact RS256 JWT over `claims`, signed with `key` and naming `kid`. */
-export async function signJwt(key: CryptoKey, kid: string, claims: Record<string, unknown>): Promise<string> {
-  const head = b64url(enc.encode(JSON.stringify({ alg: "RS256", kid, typ: "JWT" })));
+/**
+ * A compact JWT over `claims`, signed RS256 with `key` and naming `kid`. `headOver` replaces
+ * header fields, so a test can claim another `alg` over a real RS256 signature.
+ */
+export async function signJwt(key: CryptoKey, kid: string, claims: Record<string, unknown>, headOver: Record<string, unknown> = {}): Promise<string> {
+  const head = b64url(enc.encode(JSON.stringify({ alg: "RS256", kid, typ: "JWT", ...headOver })));
   const body = b64url(enc.encode(JSON.stringify(claims)));
   const sig = await crypto.subtle.sign(RSA.name, key, enc.encode(`${head}.${body}`));
   return `${head}.${body}.${b64url(sig)}`;

@@ -123,4 +123,28 @@ describe("room socket", () => {
     const b = await joinOrch(P, uid("ws-h"));
     expect((await get(b, "sync", "?since=999999999")).body.roster.find((r: any) => r.name === me).state).toBe("stale");
   });
+
+  it("a failure while telling the sockets never reaches the caller", async () => {
+    const a = await joinOrch(P, uid("ws-i"));
+    const s = await openSocket(P);
+    await until(() => s.msgs.length > 0);
+    const stub = (rawEnv as any).ROOM.get((rawEnv as any).ROOM.idFromName(P));
+    await (runInDurableObject as any)(stub, async (room: any) => {
+      room.taskView = () => {
+        throw new Error("taskView broke");
+      };
+    });
+    const title = uid("after a broken broadcast");
+    let r;
+    try {
+      r = await post(a, "task", { title });
+    } finally {
+      await (runInDurableObject as any)(stub, async (room: any) => {
+        delete room.taskView;
+      });
+    }
+    expect(r.status).toBe(200);
+    const board = (await human(`/h/${P}/board`)).body.tasks;
+    expect(board.some((t: any) => t.id === r.body.task_id && t.title === title)).toBe(true);
+  });
 });

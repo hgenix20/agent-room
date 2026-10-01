@@ -219,7 +219,7 @@ export class ProjectRoom extends DurableObject<Env> {
       );
       this.sql.exec(
         `UPDATE tasks SET ended_at = (SELECT MAX(e.created_at) FROM events e
-           WHERE e.kind = 'release' AND e.task_id = tasks.id AND json_extract(e.data, '$.state') = 'done')
+           WHERE e.kind = 'release' AND e.task_id = tasks.id AND json_valid(e.data) AND json_extract(e.data, '$.state') = 'done')
          WHERE state = 'done' AND ended_at IS NULL`,
       );
       this.sql.exec("INSERT INTO meta (k, v) VALUES ('task_times_backfilled', '1') ON CONFLICT(k) DO NOTHING");
@@ -240,37 +240,44 @@ export class ProjectRoom extends DurableObject<Env> {
     return out;
   }
 
-  /** New events in seq order, then each changed task, then the roster when it changed. */
+  /**
+   * New events in seq order, then each changed task, then the roster when it changed. Runs after
+   * the transaction has committed, so a failure here is logged and never reaches the caller.
+   */
   private broadcast(before: number): void {
-    const dirty = new Set(this.dirtyTasks);
-    this.dirtyTasks.clear();
-    const socks = this.openSockets();
-    if (!socks.length) return;
-    const now = this.now();
-    const out: string[] = [];
-    let roster = false;
-    for (const r of this.rows<Record<string, SqlStorageValue>>(`${EVENT_SELECT} WHERE e.seq > ? ORDER BY e.seq`, before)) {
-      out.push(JSON.stringify({ type: "event", event: this.viewEvent(r) }));
-      if (ROSTER_KINDS.has(r.kind as string)) roster = true;
-      if (r.task_id && TASK_KINDS.has(r.kind as string)) dirty.add(r.task_id as string);
-    }
-    for (const id of dirty) {
-      const t = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", id);
-      if (t) out.push(JSON.stringify({ type: "task", task: this.taskView(t, now) }));
-    }
-    if (roster) out.push(JSON.stringify({ type: "roster", roster: this.rosterView(now) }));
-    if (!out.length) return;
-    for (const ws of socks) {
-      try {
-        for (const m of out) ws.send(m);
-      } catch {
-        // A socket that cannot take a message is closed; the call that caused it is unaffected.
+    try {
+      const dirty = new Set(this.dirtyTasks);
+      this.dirtyTasks.clear();
+      const socks = this.openSockets();
+      if (!socks.length) return;
+      const now = this.now();
+      const out: string[] = [];
+      let roster = false;
+      for (const r of this.rows<Record<string, SqlStorageValue>>(`${EVENT_SELECT} WHERE e.seq > ? ORDER BY e.seq`, before)) {
+        out.push(JSON.stringify({ type: "event", event: this.viewEvent(r) }));
+        if (ROSTER_KINDS.has(r.kind as string)) roster = true;
+        if (r.task_id && TASK_KINDS.has(r.kind as string)) dirty.add(r.task_id as string);
+      }
+      for (const id of dirty) {
+        const t = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", id);
+        if (t) out.push(JSON.stringify({ type: "task", task: this.taskView(t, now) }));
+      }
+      if (roster) out.push(JSON.stringify({ type: "roster", roster: this.rosterView(now) }));
+      if (!out.length) return;
+      for (const ws of socks) {
         try {
-          ws.close(1011, "send failed");
+          for (const m of out) ws.send(m);
         } catch {
-          /* already closed */
+          // A socket that cannot take a message is closed; the call that caused it is unaffected.
+          try {
+            ws.close(1011, "send failed");
+          } catch {
+            /* already closed */
+          }
         }
       }
+    } catch (e) {
+      console.error("broadcast failed", e);
     }
   }
 

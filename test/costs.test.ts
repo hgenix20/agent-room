@@ -105,6 +105,26 @@ describe("task start and end", () => {
     expect(span).toBeLessThan(7 * 60_000 + 10_000);
     expect(row.actual_minutes).toBe(7);
   });
+
+  it("the backfill skips an event whose data is not JSON instead of throwing", async () => {
+    const a = await joinOrch("other", uid("mig-bad"));
+    const t = await newTask(a, "old task, bad event");
+    const c = await post(a, "claim", { task_id: t, scopes: [uid("mig-bad-scope")] });
+    await post(a, "release", { claim_id: c.body.claim_id, version: c.body.version, state: "done" });
+    const stub = env.ROOM.get(env.ROOM.idFromName("other"));
+    await (runInDurableObject as any)(stub, async (room: any, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      const seq = sql.exec("INSERT INTO events (kind, ref_id, agent_id, task_id, data, created_at) VALUES ('release', NULL, ?, ?, 'not json', 1) RETURNING seq", a.id, t).one().seq;
+      try {
+        sql.exec("UPDATE tasks SET ended_at = NULL WHERE id = ?", t);
+        sql.exec("DELETE FROM meta WHERE k = 'task_times_backfilled'");
+        expect(() => room.migrate()).not.toThrow();
+      } finally {
+        sql.exec("DELETE FROM events WHERE seq = ?", seq);
+      }
+    });
+    expect((await taskRow(a, t)).ended_at).not.toBeNull();
+  });
 });
 
 describe("token reports", () => {
