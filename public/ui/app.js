@@ -9,6 +9,8 @@ import {
 const MAX_LINES = 500;
 const PAGE = 200;
 const FAR = 9007199254740991;
+const PING_EVERY_MS = 30000;
+const PONG_WAIT_MS = 10000;
 const COLS = [
   ["id", "id"], ["title", "task"], ["priority", "pri"], ["owner", "owner"], ["state", "status"],
   ["estimate_minutes", "est"], ["estimate_tokens", "est tok"], ["started_at", "start"], ["ended_at", "end"],
@@ -31,6 +33,8 @@ const st = {
   seen: new Set(), cursor: 0, oldest: null, moreOlder: false, loadingOlder: false,
   roster: [], tasks: new Map(), expanded: new Set(), sort: { col: "id", dir: 1 }, editing: false,
   ws: null, backoff: 1000, status: "connecting", signedOut: false,
+  // While a catch-up runs, socket messages wait here and are applied in arrival order after it.
+  catching: 0, queue: [], queueBroken: false,
 };
 
 const myName = () => (st.me ? st.me.name : "");
@@ -148,7 +152,8 @@ function showEvents(events, atTop = false) {
     if (e.seq > st.cursor) st.cursor = e.seq;
     if (st.oldest === null || e.seq < st.oldest) st.oldest = e.seq;
   }
-  addLines(fresh.map((e) => eventLine(e, myName())), atTop);
+  const lines = fresh.map((e) => eventLine(e, myName())).filter((line) => line !== null);
+  if (lines.length) addLines(lines, atTop);
 }
 
 function rosterRow(r, away) {
@@ -311,7 +316,13 @@ async function loadBoard(project) {
   renderGrid();
 }
 
-/** First load: the newest page of events. After a reconnect: everything since the cursor. */
+/**
+ * First load: the newest page of events. After a reconnect: everything since the cursor, paged
+ * with a local cursor so an event the socket delivers meanwhile cannot skip part of the gap.
+ * Returns false when the room refused a page. A failed catch-up after a reconnect closes the
+ * socket, so the close handler retries; the messages queued meanwhile are dropped, because the
+ * next catch-up reads them again.
+ */
 async function catchUp(initial) {
   if (initial) {
     const r = await api(h("sync", `?before=${FAR}&limit=${PAGE}`));
@@ -324,17 +335,41 @@ async function catchUp(initial) {
     st.roster = r.body.roster;
     showEvents(r.body.events);
   } else {
-    for (let more = true; more; ) {
-      const r = await api(h("sync", `?since=${st.cursor}&limit=500`));
-      if (r.status !== 200) break;
-      showEvents(r.body.events);
-      st.cursor = Math.max(st.cursor, r.body.cursor);
-      st.roster = r.body.roster;
-      more = r.body.more;
+    st.catching += 1;
+    let ok = false;
+    try {
+      ok = await readSince();
+    } finally {
+      st.catching -= 1;
+      if (!ok) st.queueBroken = true;
+      if (st.catching === 0) {
+        const queued = st.queue;
+        const broken = st.queueBroken;
+        st.queue = [];
+        st.queueBroken = false;
+        if (!broken) for (const msg of queued) onMessage(msg);
+      }
+      if (!ok && st.ws) st.ws.close();
     }
+    if (!ok) return false;
   }
   renderRoster();
   await loadBoard(st.project);
+  return true;
+}
+
+/** Reads every event after the cursor, page by page. False when the room refuses a page. */
+async function readSince() {
+  let cursor = st.cursor;
+  for (let more = true; more; ) {
+    const r = await api(h("sync", `?since=${cursor}&limit=500`));
+    if (r.status !== 200) return false;
+    showEvents(r.body.events);
+    cursor = Math.max(cursor, r.body.cursor);
+    st.roster = r.body.roster;
+    more = r.body.more;
+  }
+  st.cursor = Math.max(st.cursor, cursor);
   return true;
 }
 
@@ -371,21 +406,47 @@ function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${scheme}://${location.host}/h/${st.project}/ws`);
   st.ws = ws;
+  // A socket that died without a close frame looks like a quiet room. The room answers the
+  // text ping with pong; no pong within PONG_WAIT_MS closes the socket, and the close handler
+  // reconnects.
+  let pongWait = null;
+  const pinger = setInterval(() => {
+    if (ws.readyState !== 1 || pongWait !== null) return;
+    ws.send("ping");
+    pongWait = setTimeout(() => ws.close(), PONG_WAIT_MS);
+  }, PING_EVERY_MS);
+  const stopPing = () => {
+    clearInterval(pinger);
+    clearTimeout(pongWait);
+    pongWait = null;
+  };
   ws.addEventListener("open", () => {
-    st.backoff = 1000;
-    setStatus("live");
-    catchUp(false).catch(() => {});
+    catchUp(false).then(
+      (ok) => {
+        if (!ok || st.ws !== ws) return;
+        st.backoff = 1000;
+        setStatus("live");
+      },
+      (e) => console.warn("catch-up failed; the socket is closed and will reconnect", e),
+    );
   });
   ws.addEventListener("message", (m) => {
+    if (m.data === "pong") {
+      clearTimeout(pongWait);
+      pongWait = null;
+      return;
+    }
     let msg;
     try {
       msg = JSON.parse(m.data);
     } catch {
       return;
     }
-    onMessage(msg);
+    if (st.catching) st.queue.push(msg);
+    else onMessage(msg);
   });
   ws.addEventListener("close", async () => {
+    stopPing();
     if (st.signedOut || st.ws !== ws) return;
     setStatus("reconnecting");
     // An expired session closes the socket too; this call finds that out and stops the retries.

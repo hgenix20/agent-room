@@ -145,11 +145,11 @@ describe("the channel", () => {
   it("a message becomes nick, task and text, and markup stays text", () => {
     const line = eventLine({ seq: 5, kind: "say", at: 1, by: "sub-a2/T7", text: "<script>alert(1)</script> <b>hi</b>", mentions: ["kameron"] }, "kameron");
     expect(line).toEqual({ seq: 5, at: 1, kind: "msg", nick: "sub-a2", task: "T7", text: "<script>alert(1)</script> <b>hi</b>", mention: true });
-    expect(eventLine({ seq: 6, kind: "say", at: 1, by: "orch-a", text: "plain" }, "kameron").mention).toBe(false);
+    expect(eventLine({ seq: 6, kind: "say", at: 1, by: "orch-a", text: "plain" }, "kameron")!.mention).toBe(false);
   });
 
   it("room events read as sentences", () => {
-    const text = (e: any) => eventLine({ seq: 1, at: 1, ...e }, "kameron").text;
+    const text = (e: any) => eventLine({ seq: 1, at: 1, ...e }, "kameron")!.text;
     expect(text({ kind: "join", name: "sub-a2", model: "claude sonnet", parent: "orch-a" })).toBe("sub-a2 [claude sonnet] has joined (parent orch-a)");
     expect(text({ kind: "claim", by: "sub-a2/T7", task: "T7", title: "auth middleware", scopes: ["src/auth/*", "db-schema"] })).toBe('sub-a2 claimed T7 "auth middleware" [src/auth/*, db-schema]');
     expect(text({ kind: "release", by: "sub-b1/T9", task: "T9", state: "done", branch: "agent/t9", commit: "3f9a2c1", minutes: 31, tokens: 48000 })).toBe("sub-b1 released T9 done [agent/t9 3f9a2c1] 31m, 48k tok");
@@ -162,8 +162,8 @@ describe("the channel", () => {
     expect(text({ kind: "roster", name: "kam", state: "renamed", was: "kameron" })).toBe("kameron is now known as kam");
     expect(text({ kind: "roster", name: "orch-b", state: "stale" })).toBe("orch-b is away");
     expect(text({ kind: "roster", name: "orch-b", state: "removed", reason: "token revoked" })).toBe("orch-b was removed (token revoked)");
-    expect(text({ kind: "status", name: "sub-a2", status_line: "running tests" })).toBe("sub-a2: running tests");
-    expect(eventLine({ seq: 1, at: 1, kind: "join", name: "x", model: "m", parent: null }, "kameron").kind).toBe("sys");
+    expect(eventLine({ seq: 1, at: 1, kind: "status", name: "sub-a2", status_line: "running tests" }, "kameron")).toBeNull();
+    expect(eventLine({ seq: 1, at: 1, kind: "join", name: "x", model: "m", parent: null }, "kameron")!.kind).toBe("sys");
   });
 
   it("drops events it has already shown and orders the rest", () => {

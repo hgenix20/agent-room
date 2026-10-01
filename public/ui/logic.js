@@ -254,15 +254,17 @@ function sysText(e) {
       return updateText(e);
     case "roster":
       return (ROSTER_TEXT[e.state] ?? ((x) => `${x.name}: ${x.state}`))(e);
-    case "status":
-      return `${e.name}: ${e.status_line}`;
     default:
       return String(e.kind);
   }
 }
 
-/** One event as a channel line. Text is returned as it came; the page must write it with textContent. */
+/**
+ * One event as a channel line, or null for an event that makes no line (a status change shows
+ * in the roster's tooltip). Text is returned as it came; the page must write it with textContent.
+ */
 export function eventLine(e, selfName) {
+  if (e.kind === "status") return null;
   if (e.kind === "say") {
     const [nick, task] = String(e.by ?? "?").split("/");
     return { seq: e.seq, at: e.at, kind: "msg", nick, task: task ?? null, text: String(e.text ?? ""), mention: (e.mentions ?? []).includes(selfName) };
