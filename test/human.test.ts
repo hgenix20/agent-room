@@ -203,6 +203,20 @@ describe("nobody writes a line that reads as someone else's", () => {
     const after = (await human(`/h/${P}/board`)).body.tasks;
     expect(after.find((x: any) => x.id === t).title).toBe(`${tag} new title`);
   });
+
+  it("a title with U+2028 or U+2029 is stored with a space in place of each", async () => {
+    const tag = uid("sep");
+    const ip = newIp();
+    const r = await req(`/p/${P}/join`, {
+      ip,
+      body: { name: tag, model: "m", project_key: `test-key-${P}`, orchestrator_credential: "orch-cred-box" },
+    });
+    expect(r.status).toBe(200);
+    const a = { id: r.body.agent_id, name: r.body.name, token: r.body.token, cursor: r.body.cursor, ip, project: P };
+    const t = await newTask(a, `${tag} one\u2028two\u2029three`);
+    const board = (await human(`/h/${P}/board`)).body.tasks;
+    expect(board.find((x: any) => x.id === t).title).toBe(`${tag} one two three`);
+  });
 });
 
 describe("small guards", () => {

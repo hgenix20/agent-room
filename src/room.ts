@@ -1330,7 +1330,7 @@ function checkSecret(text: string): void {
 
 /** A single-line field stored as one line: each control character becomes a space. Never refuses. */
 function oneLine(s: string): string {
-  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ");
 }
 
 /** The room's own speaker; nobody may take the name, in any letter case. */

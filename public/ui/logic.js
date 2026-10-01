@@ -207,7 +207,7 @@ export function topicLine(project, roster, tasks) {
 
 // Control characters, and the bidi and zero-width characters that can make text read in an
 // order other than the one it was written in.
-const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g;
 
 /** A single-line field made safe to show: each character UNSAFE matches becomes a visible dot. */
 export function clean(s) {
@@ -291,7 +291,7 @@ export function eventLine(e, selfName) {
   if (e.kind === "status") return null;
   if (e.kind === "say") {
     const [nick, task] = String(e.by ?? "?").split("/");
-    const [text, ...more] = String(e.text ?? "").split(/\r\n|\n|\r/).map(clean);
+    const [text, ...more] = String(e.text ?? "").split(/\r\n|\n|\r|\u2028|\u2029/).map(clean);
     return {
       seq: e.seq, at: e.at, kind: "msg", nick: clean(nick), task: task === undefined ? null : clean(task),
       text, more, mention: (e.mentions ?? []).includes(selfName),
