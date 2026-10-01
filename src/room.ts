@@ -110,7 +110,7 @@ interface TaskRow {
   [k: string]: SqlStorageValue;
 }
 
-const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "claim", "release", "leave", "adopt"]);
+const WRITE_ACTIONS = new Set(["heartbeat", "say", "task", "task_update", "claim", "release", "leave", "adopt"]);
 
 export class ProjectRoom extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -579,6 +579,8 @@ export class ProjectRoom extends DurableObject<Env> {
         return this.board(now);
       case "task":
         return this.createTask(me, body, now);
+      case "task_update":
+        return this.updateTask(me, body, now);
       case "claim":
         return this.claim(me, body, now);
       case "release":
@@ -727,6 +729,41 @@ export class ProjectRoom extends DurableObject<Env> {
       priority, estimate_minutes: estMinutes, estimate_tokens: estTokens,
     });
     return { status: 200, body: { task_id: id } };
+  }
+
+  /** Change a task's title, detail, priority or estimates. An agent may change a task it created or holds. */
+  private updateTask(me: AgentRow, body: Record<string, unknown>, now: number): Result {
+    const taskId = str(body.task_id, "task_id", 40, true);
+    const t = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId);
+    if (!t) throw new HttpError(404, { error: "unknown_task", task: taskId });
+    const mine = t.created_by === me.id || this.liveClaimsOf(me.id).some((c) => c.task_id === taskId);
+    if (!mine) throw new HttpError(403, { error: "not_yours", detail: "you can update a task you created or hold a claim on" });
+
+    const next: Record<string, string | number | null> = {};
+    if (body.title !== undefined) next.title = str(body.title, "title", LIMITS.titleChars, true);
+    if (body.detail !== undefined) next.detail = body.detail === null ? "" : str(body.detail, "detail", LIMITS.messageChars);
+    if (body.priority !== undefined) next.priority = priorityOf(body.priority);
+    if (body.estimate_minutes !== undefined) {
+      next.estimate_minutes = body.estimate_minutes === null ? null : intOf(body.estimate_minutes, "bad_estimate_minutes", 1, LIMITS.estimateMinutesMax);
+    }
+    if (body.estimate_tokens !== undefined) {
+      next.estimate_tokens = body.estimate_tokens === null ? null : intOf(body.estimate_tokens, "bad_estimate_tokens", 0, LIMITS.tokensMax);
+    }
+    if (next.title !== undefined || next.detail !== undefined) checkSecret(`${next.title ?? ""}
+${next.detail ?? ""}`);
+
+    const cols = Object.keys(next).filter((k) => t[k] !== next[k]);
+    if (!cols.length) throw new HttpError(400, { error: "no_change" });
+    const changes: Record<string, [unknown, unknown]> = {};
+    // The detail can be 5000 characters; the event says it changed without carrying the text.
+    for (const k of cols) changes[k] = k === "detail" ? [null, null] : [t[k], next[k]];
+    // cols holds only the five keys set above, so building the SET list from it is safe.
+    this.sql.exec(
+      `UPDATE tasks SET ${cols.map((c) => `${c} = ?`).join(", ")}, updated_at = ? WHERE id = ?`,
+      ...cols.map((c) => next[c]), now, taskId,
+    );
+    this.event("task_updated", taskId, me.id, taskId, { task: taskId, by: me.name, changes });
+    return { status: 200, body: { ok: true, task_id: taskId, changed: cols } };
   }
 
   private claim(me: AgentRow, body: Record<string, unknown>, now: number): Result {

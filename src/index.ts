@@ -27,7 +27,7 @@ export interface Env {
   BLOCK_CACHE_MS?: string;
 }
 
-const ROOM_CALLS = new Set(["heartbeat", "sync", "say", "board", "task", "claim", "release", "leave", "whoami", "adopt"]);
+const ROOM_CALLS = new Set(["heartbeat", "sync", "say", "board", "task", "task_update", "claim", "release", "leave", "whoami", "adopt"]);
 const GET_CALLS = new Set(["sync", "board", "whoami"]);
 const MAX_BODY = 64 * 1024;
 
@@ -264,7 +264,7 @@ export default {
       const admin = path.match(/^\/admin\/([a-z]+)$/);
       if (admin) return await handleAdmin(env, req, admin[1], url);
 
-      const m = path.match(/^\/p\/([^/]+)\/([a-z]+)$/);
+      const m = path.match(/^\/p\/([^/]+)\/([a-z_]+)$/);
       if (!m) {
         if (path === "/" || path === "/health") return json({ service: "agent-room", ok: true });
         return json({ error: "not_found" }, 404);

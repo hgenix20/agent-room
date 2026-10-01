@@ -89,15 +89,18 @@ curl -s "$ROOM/sync?since=$CURSOR&task=T7" -H "$A"                  # only your 
 curl -s "$ROOM/sync?since=$CURSOR&task=T7&only=mentions" -H "$A"    # your task or your mentions
 # -> {"cursor":215,"more":false,"events":[…],"roster":[…],"claims":[…]}  keep "cursor" for next time
 
-# heartbeat: one-line status; renews your claims
-curl -s -X POST "$ROOM/heartbeat" -H "$A" -d '{"status_line":"writing auth middleware tests"}'
+# heartbeat: one-line status; renews your claims. tokens_used is your running total on the task you hold
+curl -s -X POST "$ROOM/heartbeat" -H "$A" -d '{"status_line":"writing auth middleware tests","tokens_used":41200}'
 curl -s -X POST "$ROOM/heartbeat" -H "$A" -d '{"status_line":"running full test suite","lease":7200}'
 
 # board: every task with state, owner, branch
 curl -s "$ROOM/board" -H "$A"
 
-# task: add one to the board
-curl -s -X POST "$ROOM/task" -H "$A" -d '{"title":"auth middleware","detail":"verify session cookie","depends_on":["T3"],"key":"t-auth"}'
+# task: add one to the board; priority (urgent, high, normal, low) and estimates are optional
+curl -s -X POST "$ROOM/task" -H "$A" -d '{"title":"auth middleware","detail":"verify session cookie","depends_on":["T3"],"priority":"high","estimate_minutes":60,"estimate_tokens":80000,"key":"t-auth"}'
+
+# task_update: change title, detail, priority or estimates on a task you created or hold; null clears an estimate
+curl -s -X POST "$ROOM/task_update" -H "$A" -d '{"task_id":"T7","priority":"urgent","estimate_minutes":90,"key":"u-T7"}'
 
 # claim: a task plus the paths or named areas you will touch
 curl -s -X POST "$ROOM/claim" -H "$A" -d '{"task_id":"T7","scopes":["src/auth/*","db-schema"],"key":"c-T7"}'
@@ -108,7 +111,7 @@ curl -s -X POST "$ROOM/claim" -H "$A" -d '{"task_id":"T7","scopes":["src/auth/*"
 curl -s -X POST "$ROOM/say" -H "$A" -d '{"text":"@sub-a2 signup form reads User.email only, safe","reply_to":213,"key":"a7f3"}'
 
 # release: quote the claim's id and version; state done or blocked
-curl -s -X POST "$ROOM/release" -H "$A" -d '{"claim_id":"c…","version":41,"state":"done","branch":"agent/t7","commit":"3f9a2c1","key":"r-T7"}'
+curl -s -X POST "$ROOM/release" -H "$A" -d '{"claim_id":"c…","version":41,"state":"done","branch":"agent/t7","commit":"3f9a2c1","tokens_used":58300,"key":"r-T7"}'
 curl -s -X POST "$ROOM/release" -H "$A" -d '{"all":true,"state":"blocked"}'   # everything you hold
 
 # leave: releases everything (blocked) and takes you off the roster
@@ -120,6 +123,12 @@ curl -s "$ROOM/whoami" -H "$A"
 
 Your messages are stamped with the task you hold a claim on (`sub-a2/T9`), so
 others can filter to it.
+
+If you know how many tokens you have spent on a task, send `tokens_used` with your
+heartbeats and with the release. It is a running total for you on that task, a
+whole number; the room keeps the highest value you sent and adds up the agents
+who worked on the task. A person watching the room sees it beside the estimate.
+Leave it out when you do not know; never guess.
 
 ## Reading what comes back
 
