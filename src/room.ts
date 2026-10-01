@@ -159,6 +159,9 @@ export class ProjectRoom extends DurableObject<Env> {
         agent_id TEXT PRIMARY KEY, step INTEGER NOT NULL DEFAULT 0, since_seq INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS strikes (agent_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS claim_lock (agent_id TEXT PRIMARY KEY, until INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_tokens (
+        task_id TEXT NOT NULL, agent_id TEXT NOT NULL, tokens INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (task_id, agent_id));
     `);
     this.migrate();
     const off = this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'clock_offset'").toArray()[0];
@@ -606,6 +609,8 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private heartbeat(me: AgentRow, body: Record<string, unknown>, now: number): Result {
+    const tokens = body.tokens_used === undefined || body.tokens_used === null ? null : intOf(body.tokens_used, "bad_tokens_used", 0, LIMITS.tokensMax);
+    let tokensIgnored = false;
     const status = body.status_line === undefined ? me.status_line : str(body.status_line, "status_line", LIMITS.statusChars);
     checkSecret(status);
     const leaseMs = body.lease === undefined ? null : leaseOf(body.lease);
@@ -621,7 +626,12 @@ export class ProjectRoom extends DurableObject<Env> {
       this.sql.exec("UPDATE agents SET status_line = ?, task_id = ? WHERE id = ?", status, task, me.id);
       this.event("status", me.id, me.id, task, { name: me.name, task, status_line: status });
     }
-    return { status: 200, body: { ok: true, renewed } };
+    if (tokens !== null) {
+      const held = this.currentTask(me.id);
+      if (held) this.reportTokens(held, me.id, tokens, now);
+      else tokensIgnored = true;
+    }
+    return { status: 200, body: tokensIgnored ? { ok: true, renewed, tokens_ignored: true } : { ok: true, renewed } };
   }
 
   private say(me: AgentRow, body: Record<string, unknown>, now: number): Result {
@@ -814,6 +824,7 @@ export class ProjectRoom extends DurableObject<Env> {
     if (state !== "done" && state !== "blocked") throw new HttpError(400, { error: "bad_state", detail: "state is done or blocked" });
     const commit = body.commit === undefined || body.commit === null ? null : str(body.commit, "commit", 80);
     const branch = body.branch === undefined || body.branch === null ? null : str(body.branch, "branch", 200);
+    const tokens = body.tokens_used === undefined || body.tokens_used === null ? null : intOf(body.tokens_used, "bad_tokens_used", 0, LIMITS.tokensMax);
     let targets: ClaimRow[];
     if (body.all === true) {
       targets = this.liveClaimsOf(me.id);
@@ -827,6 +838,9 @@ export class ProjectRoom extends DurableObject<Env> {
       if (c.state !== "live") throw new HttpError(409, { error: "claim_not_live", state: c.state });
       targets = [c];
     }
+    if (tokens !== null && targets.length > 1) {
+      throw new HttpError(400, { error: "tokens_need_one_claim", detail: "tokens_used names one task; release that claim by its id" });
+    }
     const released = [];
     for (const c of targets) {
       this.sql.exec("UPDATE claims SET state = 'released' WHERE id = ?", c.id);
@@ -836,7 +850,13 @@ export class ProjectRoom extends DurableObject<Env> {
       );
       if (state === "done") this.sql.exec("UPDATE tasks SET ended_at = ? WHERE id = ?", now, c.task_id);
       this.sql.exec("UPDATE agents SET task_id = NULL WHERE id = ? AND task_id = ?", me.id, c.task_id);
-      this.event("release", c.id, me.id, c.task_id, { by: this.label(me, c.task_id), task: c.task_id, state, commit, branch, claim_id: c.id });
+      if (tokens !== null) this.reportTokens(c.task_id, me.id, tokens, now);
+      const after = this.first<TaskRow>("SELECT * FROM tasks WHERE id = ?", c.task_id)!;
+      this.event("release", c.id, me.id, c.task_id, {
+        by: this.label(me, c.task_id), task: c.task_id, state, commit, branch, claim_id: c.id,
+        minutes: after.ended_at !== null ? actualMinutes(after, now) : null,
+        tokens: this.taskTokens(c.task_id),
+      });
       released.push({ claim_id: c.id, task_id: c.task_id, state });
     }
     return { status: 200, body: { ok: true, released } };
@@ -847,6 +867,21 @@ export class ProjectRoom extends DurableObject<Env> {
     this.sql.exec("UPDATE agents SET state = 'left', task_id = NULL WHERE id = ?", me.id);
     this.event("roster", me.id, me.id, null, { name: me.name, state: "left" });
     return { status: 200, body: { ok: true, released: r.body.released } };
+  }
+
+  /** One running total per agent per task; a later, lower number never replaces a higher one. */
+  private reportTokens(taskId: string, agentId: string, tokens: number, now: number): void {
+    this.sql.exec(
+      `INSERT INTO task_tokens (task_id, agent_id, tokens, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(task_id, agent_id) DO UPDATE SET tokens = MAX(tokens, excluded.tokens), updated_at = excluded.updated_at`,
+      taskId, agentId, tokens, now,
+    );
+    this.sql.exec("UPDATE tasks SET updated_at = ? WHERE id = ?", now, taskId);
+  }
+
+  /** The task's total across agents, or null when no agent has reported. */
+  private taskTokens(taskId: string): number | null {
+    return this.first<{ s: number | null }>("SELECT SUM(tokens) AS s FROM task_tokens WHERE task_id = ?", taskId)?.s ?? null;
   }
 
   private taskView(t: TaskRow, now: number): Record<string, unknown> {
@@ -868,6 +903,7 @@ export class ProjectRoom extends DurableObject<Env> {
       started_at: t.started_at,
       ended_at: t.ended_at,
       actual_minutes: actualMinutes(t, now),
+      tokens_used: this.taskTokens(t.id),
       rev: t.updated_at,
     };
   }

@@ -106,3 +106,63 @@ describe("task start and end", () => {
     expect(row.actual_minutes).toBe(7);
   });
 });
+
+describe("token reports", () => {
+  it("sums one running total per agent, never lowers it, and reports it on release", async () => {
+    const a = await joinOrch(P, uid("tok-a"));
+    const b = await joinOrch(P, uid("tok-b"));
+    const t = await newTask(a, "costed");
+    const scope = uid("costed");
+    expect((await taskRow(a, t)).tokens_used).toBeNull();
+    const c1 = await post(a, "claim", { task_id: t, scopes: [scope] });
+    expect((await post(a, "heartbeat", { tokens_used: 30000 })).body.tokens_ignored).toBeUndefined();
+    await post(a, "heartbeat", { tokens_used: 20000 });
+    expect((await taskRow(a, t)).tokens_used).toBe(30000);
+    await post(a, "release", { claim_id: c1.body.claim_id, version: c1.body.version, state: "blocked" });
+    const c2 = await post(b, "claim", { task_id: t, scopes: [scope] });
+    await advance(P, 2 * 60_000);
+    const cursor = (await get(b, "sync", "?since=999999999")).body.cursor;
+    const rel = await post(b, "release", { claim_id: c2.body.claim_id, version: c2.body.version, state: "done", tokens_used: 12000 });
+    expect(rel.status).toBe(200);
+    expect((await taskRow(b, t)).tokens_used).toBe(42000);
+    const ev = (await get(b, "sync", `?since=${cursor}`)).body.events.find((e: any) => e.kind === "release" && e.task === t);
+    expect(ev.tokens).toBe(42000);
+    expect(typeof ev.minutes).toBe("number");
+  });
+
+  it("ignores a report from an agent that holds no claim, and says so", async () => {
+    const a = await joinOrch(P, uid("tok-n"));
+    const t = await newTask(a, "unclaimed");
+    const r = await post(a, "heartbeat", { tokens_used: 500 });
+    expect(r.status).toBe(200);
+    expect(r.body.tokens_ignored).toBe(true);
+    expect((await taskRow(a, t)).tokens_used).toBeNull();
+  });
+
+  it("refuses a value that is not a whole number in range", async () => {
+    const a = await joinOrch(P, uid("tok-bad"));
+    const t = await newTask(a, "bad tokens");
+    const c = await post(a, "claim", { task_id: t, scopes: [uid("tb")] });
+    for (const v of [-1, 1.5, "12", 2000000001]) {
+      const r = await post(a, "heartbeat", { tokens_used: v });
+      expect(r.status).toBe(400);
+      expect(r.body.error).toBe("bad_tokens_used");
+    }
+    const r = await post(a, "release", { claim_id: c.body.claim_id, version: c.body.version, state: "done", tokens_used: -5 });
+    expect(r.status).toBe(400);
+    expect((await taskRow(a, t)).state).toBe("claimed");
+  });
+
+  it("refuses one token number for several claims and releases none of them", async () => {
+    const a = await joinOrch(P, uid("tok-all"));
+    const t1 = await newTask(a, "one");
+    const t2 = await newTask(a, "two");
+    await post(a, "claim", { task_id: t1, scopes: [uid("x")] });
+    await post(a, "claim", { task_id: t2, scopes: [uid("y")] });
+    const r = await post(a, "release", { all: true, state: "blocked", tokens_used: 100 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe("tokens_need_one_claim");
+    expect((await taskRow(a, t1)).state).toBe("claimed");
+    expect((await taskRow(a, t2)).state).toBe("claimed");
+  });
+});
