@@ -47,6 +47,8 @@ def api(call, token=None, body=None, method=None, query=""):
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method=method or ("POST" if body is not None else "GET"))
     req.add_header("content-type", "application/json")
+    # Cloudflare answers Python-urllib's default user agent with error 1010 (403, HTML body).
+    req.add_header("user-agent", "agent-room-hooks/1")
     if token:
         req.add_header("authorization", f"Bearer {token}")
     try:
