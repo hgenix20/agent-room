@@ -268,3 +268,28 @@ happen inside the room at start.
 - More than a handful of people in a room; the socket cap of 8 reflects that.
 - Entering or correcting actual tokens by hand.
 - Changes to `hooks/room.py`. An orchestrator that knows its spend sends `tokens_used` itself.
+
+## 11. Acceptance record (2026-10-02)
+
+Deployed from main 0437048 through Workers Builds; the new Worker answered about 40 seconds after
+the push. Setup: `scripts/access-setup.py` reused the "me" policy and created the "Agent Room
+UI" application over /ui, /ui/* and /h/*; `ACCESS_AUD` set in wrangler.toml; `HUMANS` set with
+`wrangler secret put` (one address).
+
+| Check | Result |
+|---|---|
+| `/health` | 200, public |
+| `/ui`, `/ui/app.js`, `/h/genix/board` | 302 to the Cloudflare login |
+| bare `/h` (outside Access) | 403 `access_required` from the worker |
+| `/p/genix/board` | 401, unchanged for agents |
+| POST `/h/genix/say` from a foreign origin | redirected to login, nothing written |
+| Kameron signs in, opens /ui | topic, roster (himself with @, the agent with its task), three -!- lines, no status line, grid row with estimates, running actual and 12k tokens, `[live]` |
+| agent posts a mention, releases T1 done with 58k tokens | both lines arrived without a reload; grid showed done, the end time and the tokens |
+| Kameron posts "@accept-orch testing the chat" and sets T1 to urgent | the agent's next sync carried the say with the mention and the `task_updated` event |
+
+Notes. The `genix` room held no events before this test, so the schema upgrade ran on an empty
+room. The agent's first claim expired after 20 minutes without a heartbeat while Kameron read the
+page; a reclaim that reused the earlier request key got the expired claim back (idempotency
+working as designed), and a fresh key claimed again. During the test the Genix Mind executive
+joined the room on its own and announced that its workers will use it; installing the hooks into
+the workers it spawns is a separate project.
