@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "deploy:dry": "wrangler deploy --dry-run --outdir .wrangler/dry"
   },
-  "license": "ISC",
+  "license": "MIT",
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260928.1",
